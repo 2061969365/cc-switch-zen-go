@@ -14,8 +14,10 @@
 //	POST /v1/messages             -> 上游 /messages（匿名上游 500，非本网关问题）
 //	POST /v1/responses            -> 上游 /responses（实测过鉴权）
 //
-//	POST /conv/v1/chat/completions|messages|responses
-//	                              -> 按模型查表转成所需格式再发上游，响应逆转
+//	GET  /health                -> 200 {"status":"ok"}（容器/Railway 健康检查）
+//	POST /v1/chat/completions|messages|responses
+//	                              -> 按模型查表：格式一致透传，不一致自动转换，响应逆转
+//	POST /conv/v1/...            -> 兼容别名，同上
 //	GET  /conv/v1/models          -> 上游 /models（透传）
 //
 // 环境变量：
@@ -122,7 +124,12 @@ func main() {
 	}
 
 	mux := http.NewServeMux()
-	// /conv/* 万能转换：任意输入格式 -> 模型所需格式。
+	// /health：容器/Railway 健康检查用，固定 200。
+	mux.HandleFunc("/health", func(w http.ResponseWriter, req *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"status":"ok"}`))
+	})
+	// /conv/* 兼容别名：与 /v1 同逻辑（模型感知自动转换）。
 	mux.HandleFunc("/conv/", func(w http.ResponseWriter, req *http.Request) {
 		convHandler(w, req, zenBase, apiKey, project)
 	})
@@ -131,6 +138,11 @@ func main() {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusNotFound)
 			_, _ = w.Write([]byte(`{"error":"not found"}`))
+			return
+		}
+		// 三个 POST 入口直接按模型自动转换（未知模型透传，保持旧行为）。
+		if req.Method == http.MethodPost && convInputFormat(req.URL.Path) != "" {
+			convHandlerInner(w, req, req.URL.Path, zenBase, apiKey, project)
 			return
 		}
 		if _, ok := routes[req.URL.Path]; !ok {
@@ -185,10 +197,14 @@ func writeConvError(w http.ResponseWriter, code int, msg string) {
 	_, _ = w.Write(b)
 }
 
-// convHandler：/conv/v1/<入口>，按模型所需格式转换后发上游，响应逆转。
-// 未知模型按输入同义端点透传（定死的策略）；gemini 直接 400。
+// convHandler：/conv/v1/<入口> 兼容别名，与 /v1 同逻辑。
+// 未知模型按输入同义端点透传；gemini 直接 400。
 func convHandler(w http.ResponseWriter, req *http.Request, zenBase *url.URL, apiKey, project string) {
-	inner := strings.TrimPrefix(req.URL.Path, "/conv")
+	convHandlerInner(w, req, strings.TrimPrefix(req.URL.Path, "/conv"), zenBase, apiKey, project)
+}
+
+// convHandlerInner：按模型所需格式转换后发上游，响应逆转。inner 为 /v1/... 内层路径。
+func convHandlerInner(w http.ResponseWriter, req *http.Request, inner string, zenBase *url.URL, apiKey, project string) {
 	if inner == "/v1/models" && req.Method == http.MethodGet {
 		upstream := *zenBase
 		upstream.Path = singleJoin(zenBase.Path, "/models")
