@@ -192,3 +192,51 @@ func TestMessagesResponsesRoundTrip(t *testing.T) {
 		t.Errorf("function_call 未转 tool_use: %s", canon(msgs))
 	}
 }
+
+func TestSanitizeResponsesInput(t *testing.T) {
+	in := mustJSON(t, `{"model":"muse-spark-1.3","input":[
+		{"role":"user","content":[{"type":"input_text","text":"hi"}]},
+		{"type":"reasoning","id":"rs_abc123","summary":[{"type":"summary_text","text":"想了一下"}]},
+		{"type":"reasoning","id":"rs_real","encrypted_content":"e30=","summary":[]},
+		{"type":"function_call","id":"fc_call_1","call_id":"call_1","name":"bash","arguments":"{}"},
+		{"type":"function_call","id":"call_2","call_id":"call_2","name":"ls","arguments":"{}"},
+		{"type":"function_call_output","call_id":"call_1","output":"ok"}]}`)
+	out := sanitizeResponsesInput(in)
+	items := asArr(out["input"])
+	// 丢 1 条无签名 reasoning，应剩 5 条。
+	if len(items) != 5 {
+		t.Fatalf("应剩 5 条，得 %d: %s", len(items), canon(items))
+	}
+	bashOK := false
+	for _, it := range items {
+		m := asMap(it)
+		if asStr(m["type"]) == "reasoning" {
+			if getStr(m, "id") != "rs_real" {
+				t.Errorf("无签名 reasoning 应丢弃: %s", canon(m))
+			}
+		}
+		if asStr(m["type"]) == "function_call" && getStr(m, "name") == "bash" {
+			bashOK = true
+			if getStr(m, "id") != "call_1" {
+				t.Errorf("fc_ 前缀 id 应还原 call_id: %s", canon(m))
+			}
+		}
+	}
+	if !bashOK {
+		t.Errorf("bash function_call 丢失")
+	}
+	// 字符串 input 原样返回。
+	s := sanitizeResponsesInput(mustJSON(t, `{"model":"m","input":"hello"}`))
+	if asStr(s["input"]) != "hello" {
+		t.Errorf("字符串 input 不应改动")
+	}
+	// 无 input 原样返回。
+	n := sanitizeResponsesInput(mustJSON(t, `{"model":"m"}`))
+	if _, ok := n["input"]; ok {
+		t.Errorf("无 input 不应新增字段")
+	}
+	// 原 map 不被污染。
+	if len(asArr(in["input"])) != 6 {
+		t.Errorf("原请求不应被修改")
+	}
+}

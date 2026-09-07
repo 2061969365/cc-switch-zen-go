@@ -962,3 +962,59 @@ func responsesToolChoiceToChat(tc any) any {
 	}
 	return tc
 }
+
+// sanitizeResponsesInput 清洗 responses 输入中的回传条目。
+//
+// 背景：网关转出的 responses 响应里 reasoning/function_call 用的是现编 ID
+// （rs_/fc_ 前缀），客户端多轮/工具调用时原样带回 input，上游不认这些 ID，
+// 会报 "Referenced reasoning item ... was not found or has expired"。
+//
+// 规则：
+//   - reasoning：无 encrypted_content 的丢弃（含网关 summary_text 退化项）；
+//     有 encrypted_content 的保留（上游可验签继续用）。
+//   - function_call：id 为网关编的 fc_<call_id> 形式时还原 id=call_id；其他保留。
+//   - 字符串 input / 无 input：原样返回。
+func sanitizeResponsesInput(in map[string]any) map[string]any {
+	raw, ok := in["input"]
+	if !ok || raw == nil {
+		return in
+	}
+	if _, ok := raw.(string); ok {
+		return in
+	}
+	var kept []any
+	for _, it := range asArr(raw) {
+		item := asMap(it)
+		switch asStr(item["type"]) {
+		case "reasoning":
+			if asStr(item["encrypted_content"]) == "" {
+				continue
+			}
+			kept = append(kept, it)
+		case "function_call":
+			id := getStr(item, "id")
+			callID := getStr(item, "call_id")
+			if callID != "" && id == "fc_"+callID {
+				cp := map[string]any{}
+				for k, v := range item {
+					cp[k] = v
+				}
+				cp["id"] = callID
+				kept = append(kept, cp)
+				continue
+			}
+			kept = append(kept, it)
+		default:
+			kept = append(kept, it)
+		}
+	}
+	out := map[string]any{}
+	for k, v := range in {
+		out[k] = v
+	}
+	if kept == nil {
+		kept = []any{}
+	}
+	out["input"] = kept
+	return out
+}

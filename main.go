@@ -270,6 +270,10 @@ func convHandlerInner(w http.ResponseWriter, req *http.Request, inner string, ze
 		case inFmt == FmtResponses && target == FmtMessages:
 			upReq = responsesToMessagesReq(in)
 		}
+	} else if inFmt == FmtResponses {
+		// responses 同格式透传：客户端下一轮可能带回上轮网关现编的
+		// reasoning/function_call 条目（rs_/fc_ 前缀 ID），上游不认，先清洗。
+		upReq = sanitizeResponsesInput(in)
 	}
 	if stream && inFmt == FmtChat {
 		// chat 流式默认不带 usage，强制加上，终态转换需要它。
