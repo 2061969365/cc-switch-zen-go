@@ -1,0 +1,26 @@
+name: Build zen-go
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - {goos: linux, goarch: amd64, suffix: ""}
+          - {goos: windows, goarch: amd64, suffix: ".exe"}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - run: gofmt -l . && go vet ./...
+      - run: GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} go build -trimpath -ldflags "-s -w" -o zen-go-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.suffix }} .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zen-go-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: zen-go-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.suffix }}
