@@ -14,6 +14,10 @@
 //	POST /v1/messages             -> 上游 /messages（匿名上游 500，非本网关问题）
 //	POST /v1/responses            -> 上游 /responses（实测过鉴权）
 //
+//	POST /conv/v1/chat/completions|messages|responses
+//	                              -> 按模型查表转成所需格式再发上游，响应逆转
+//	GET  /conv/v1/models          -> 上游 /models（透传）
+//
 // 环境变量：
 //
 //	PORT                  监听端口，默认 8080
@@ -23,13 +27,17 @@
 package main
 
 import (
+	"bytes"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
+	"io"
 	"log"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
 	"os"
+	"strings"
 	"time"
 )
 
@@ -42,7 +50,25 @@ func env(key, def string) string {
 	return def
 }
 
-// randHex 返回 n 字节的随机 hex（uuid 的轻量替代，stdlib 零依赖）。
+// newID 生成带前缀的随机 ID（resp_/msg_/chatcmpl_ 等响应包络用）。
+func newID(prefix string) string { return prefix + randHex(12) }
+
+// setZenHeaders 注入上游匿名鉴权头：Bearer + x-opencode 四件套 + UA。
+// 缺了这组头上游报 MissingSessionID（已实测）。
+func setZenHeaders(h http.Header, apiKey, project string) {
+	h.Del("Authorization")
+	h.Del("X-Api-Key")
+	h.Del("X-Goog-Api-Key")
+
+	h.Set("Authorization", "Bearer "+apiKey)
+	h.Set("User-Agent", zenUA)
+	tag := randHex(16)
+	// 客户端自带则保留（官方 opencode 直连本网关的场景）。
+	setDefault(h, "X-Opencode-Client", "opencode")
+	setDefault(h, "X-Opencode-Session", "ses_"+tag)
+	setDefault(h, "X-Opencode-Request", "req_"+tag)
+	setDefault(h, "X-Opencode-Project", project)
+}
 func randHex(n int) string {
 	b := make([]byte, n)
 	if _, err := rand.Read(b); err != nil {
@@ -81,18 +107,7 @@ func main() {
 			req.Host = zenBase.Host
 
 			// 丢掉客户端带来的鉴权头，统一用网关的匿名身份。
-			req.Header.Del("Authorization")
-			req.Header.Del("X-Api-Key")
-			req.Header.Del("X-Goog-Api-Key")
-
-			req.Header.Set("Authorization", "Bearer "+apiKey)
-			req.Header.Set("User-Agent", zenUA)
-			tag := randHex(16)
-			// 客户端自带则保留（官方 opencode 直连本网关的场景）。
-			setDefault(req.Header, "X-Opencode-Client", "opencode")
-			setDefault(req.Header, "X-Opencode-Session", "ses_"+tag)
-			setDefault(req.Header, "X-Opencode-Request", "req_"+tag)
-			setDefault(req.Header, "X-Opencode-Project", project)
+			setZenHeaders(req.Header, apiKey, project)
 		},
 		ErrorHandler: func(w http.ResponseWriter, req *http.Request, err error) {
 			log.Printf("上游错误 %s %s: %v", req.Method, req.URL.Path, err)
@@ -107,6 +122,10 @@ func main() {
 	}
 
 	mux := http.NewServeMux()
+	// /conv/* 万能转换：任意输入格式 -> 模型所需格式。
+	mux.HandleFunc("/conv/", func(w http.ResponseWriter, req *http.Request) {
+		convHandler(w, req, zenBase, apiKey, project)
+	})
 	mux.HandleFunc("/", func(w http.ResponseWriter, req *http.Request) {
 		if req.URL.Path == "/v1" {
 			w.Header().Set("Content-Type", "application/json")
@@ -125,6 +144,8 @@ func main() {
 
 	addr := ":" + env("PORT", "8080")
 	log.Printf("zen-go headless 监听 %s，上游 %s", addr, zenBase.String())
+	seedBuiltinTable()
+	go refreshTableFromOfficial()
 	log.Fatal(http.ListenAndServe(addr, mux))
 }
 
@@ -142,4 +163,180 @@ func singleJoin(base, p string) string {
 		p = "/" + p
 	}
 	return base + p
+}
+
+// conv 入口路径 -> 输入格式。
+func convInputFormat(path string) Format {
+	switch path {
+	case "/v1/chat/completions":
+		return FmtChat
+	case "/v1/messages":
+		return FmtMessages
+	case "/v1/responses":
+		return FmtResponses
+	}
+	return ""
+}
+
+func writeConvError(w http.ResponseWriter, code int, msg string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(code)
+	b, _ := json.Marshal(map[string]any{"error": msg})
+	_, _ = w.Write(b)
+}
+
+// convHandler：/conv/v1/<入口>，按模型所需格式转换后发上游，响应逆转。
+// 未知模型按输入同义端点透传（定死的策略）；gemini 直接 400。
+func convHandler(w http.ResponseWriter, req *http.Request, zenBase *url.URL, apiKey, project string) {
+	inner := strings.TrimPrefix(req.URL.Path, "/conv")
+	if inner == "/v1/models" && req.Method == http.MethodGet {
+		upstream := *zenBase
+		upstream.Path = singleJoin(zenBase.Path, "/models")
+		fwd, err := http.NewRequest(http.MethodGet, upstream.String(), nil)
+		if err != nil {
+			writeConvError(w, http.StatusBadGateway, "upstream unreachable")
+			return
+		}
+		setZenHeaders(fwd.Header, apiKey, project)
+		resp, err := http.DefaultClient.Do(fwd)
+		if err != nil {
+			writeConvError(w, http.StatusBadGateway, "upstream unreachable")
+			return
+		}
+		defer resp.Body.Close()
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(resp.StatusCode)
+		_, _ = io.Copy(w, resp.Body)
+		return
+	}
+	inFmt := convInputFormat(inner)
+	if inFmt == "" || req.Method != http.MethodPost {
+		writeConvError(w, http.StatusNotFound, "not found")
+		return
+	}
+	body, err := io.ReadAll(io.LimitReader(req.Body, 32<<20))
+	if err != nil {
+		writeConvError(w, http.StatusBadRequest, "read body: "+err.Error())
+		return
+	}
+	var in map[string]any
+	if err := json.Unmarshal(body, &in); err != nil {
+		writeConvError(w, http.StatusBadRequest, "invalid json: "+err.Error())
+		return
+	}
+	model := getStr(in, "model")
+	if model == "" {
+		writeConvError(w, http.StatusBadRequest, "missing model")
+		return
+	}
+	target, ok := lookupFormat(model)
+	if !ok {
+		target = inFmt // 未知模型：透传碰运气
+	}
+	if target == FmtGemini {
+		writeConvError(w, http.StatusBadRequest, "gemini models use /v1/models/<id>, /conv cannot convert")
+		return
+	}
+	stream := asBool(in["stream"])
+	upReq := in
+	if target != inFmt {
+		switch {
+		case inFmt == FmtChat && target == FmtResponses:
+			upReq = chatToResponsesReq(in)
+		case inFmt == FmtResponses && target == FmtChat:
+			upReq = responsesToChatReq(in)
+		case inFmt == FmtMessages && target == FmtChat:
+			upReq = messagesToChatReq(in)
+		case inFmt == FmtChat && target == FmtMessages:
+			upReq = chatToMessagesReq(in)
+		case inFmt == FmtMessages && target == FmtResponses:
+			upReq = messagesToResponsesReq(in)
+		case inFmt == FmtResponses && target == FmtMessages:
+			upReq = responsesToMessagesReq(in)
+		}
+	}
+	if stream && inFmt == FmtChat {
+		// chat 流式默认不带 usage，强制加上，终态转换需要它。
+		upReq["stream_options"] = map[string]any{"include_usage": true}
+	}
+	upBody, err := json.Marshal(upReq)
+	if err != nil {
+		writeConvError(w, http.StatusBadRequest, "encode upstream request: "+err.Error())
+		return
+	}
+	upstream := *zenBase
+	upstream.Path = singleJoin(zenBase.Path, target.upstreamPath())
+	fwd, err := http.NewRequest(http.MethodPost, upstream.String(), bytes.NewReader(upBody))
+	if err != nil {
+		writeConvError(w, http.StatusBadGateway, "upstream unreachable")
+		return
+	}
+	setZenHeaders(fwd.Header, apiKey, project)
+	fwd.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(fwd)
+	if err != nil {
+		writeConvError(w, http.StatusBadGateway, "upstream unreachable")
+		return
+	}
+	defer resp.Body.Close()
+	log.Printf("CONV %s %s -> %s 上游 %d", inner, model, target.upstreamPath(), resp.StatusCode)
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		// 上游错误原样透传，不转换。
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(resp.StatusCode)
+		_, _ = io.Copy(w, resp.Body)
+		return
+	}
+	if stream {
+		switch {
+		case inFmt == FmtChat && target == FmtResponses:
+			streamResponsesToChat(w, resp.Body, model)
+		case inFmt == FmtResponses && target == FmtChat:
+			streamChatToResponses(w, resp.Body, model)
+		case inFmt == FmtMessages && target == FmtChat:
+			streamChatToMessages(w, resp.Body, model)
+		case inFmt == FmtChat && target == FmtMessages:
+			streamMessagesToChat(w, resp.Body, model)
+		case inFmt == FmtMessages && target == FmtResponses:
+			streamResponsesToMessages(w, resp.Body, model)
+		case inFmt == FmtResponses && target == FmtMessages:
+			streamMessagesToResponses(w, resp.Body, model)
+		default:
+			// 同格式：SSE 原样透传。
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.Header().Set("Cache-Control", "no-cache")
+			_, _ = io.Copy(w, resp.Body)
+		}
+		return
+	}
+	var upResp map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&upResp); err != nil {
+		writeConvError(w, http.StatusBadGateway, "decode upstream response: "+err.Error())
+		return
+	}
+	out := upResp
+	if target != inFmt {
+		switch {
+		case inFmt == FmtChat && target == FmtResponses:
+			out = responsesToChatResp(upResp, model)
+		case inFmt == FmtResponses && target == FmtChat:
+			out = chatToResponsesResp(upResp, model)
+		case inFmt == FmtMessages && target == FmtChat:
+			out = chatToMessagesResp(upResp, model)
+		case inFmt == FmtChat && target == FmtMessages:
+			out = messagesToChatResp(upResp, model)
+		case inFmt == FmtMessages && target == FmtResponses:
+			out = responsesToMessagesResp(upResp, model)
+		case inFmt == FmtResponses && target == FmtMessages:
+			out = messagesToResponsesResp(upResp, model)
+		}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	enc := json.NewEncoder(w)
+	_ = enc.Encode(out)
+}
+
+func asBool(v any) bool {
+	b, _ := v.(bool)
+	return b
 }
