@@ -18,8 +18,9 @@ import (
 // ---------- SSE 收发 ----------
 
 type sseSink struct {
-	w http.ResponseWriter
-	f http.Flusher
+	w        http.ResponseWriter
+	f        http.Flusher
+	doneSent bool
 }
 
 func newSSESink(w http.ResponseWriter) *sseSink {
@@ -39,6 +40,10 @@ func (s *sseSink) emit(v any) {
 }
 
 func (s *sseSink) done() {
+	if s.doneSent {
+		return
+	}
+	s.doneSent = true
 	_, _ = io.WriteString(s.w, "data: [DONE]\n\n")
 	s.f.Flush()
 }

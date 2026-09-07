@@ -135,6 +135,25 @@ func TestMessagesChatRoundTrip(t *testing.T) {
 	}
 }
 
+func TestResponsesStringInput(t *testing.T) {
+	seedBuiltinTable()
+	// input 为纯字符串时应转成单条 user 消息，而不是空 messages。
+	r := responsesToChatReq(mustJSON(t, `{"model":"m","input":"hi"}`))
+	msgs := asArr(r["messages"])
+	if len(msgs) != 1 || getStr(asMap(msgs[0]), "content") != "hi" {
+		t.Errorf("string input 未转 user 消息: %s", canon(msgs))
+	}
+	m := responsesToMessagesReq(mustJSON(t, `{"model":"m","input":"hi"}`))
+	msgs = asArr(m["messages"])
+	if len(msgs) != 1 {
+		t.Fatalf("string input 未转 messages: %s", canon(msgs))
+	}
+	blocks := asArr(asMap(msgs[0])["content"])
+	if asStr(asMap(blocks[0])["text"]) != "hi" {
+		t.Errorf("文本丢失: %s", canon(blocks))
+	}
+}
+
 func TestMessagesResponsesRoundTrip(t *testing.T) {
 	msgReq := mustJSON(t, `{"model":"muse-spark-1.3-contributor-free",
 		"messages":[{"role":"user","content":"讲个笑话"}],

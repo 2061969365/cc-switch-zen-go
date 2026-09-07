@@ -256,83 +256,90 @@ func responsesToChatReq(in map[string]any) map[string]any {
 	if ins := getStr(in, "instructions"); ins != "" {
 		messages = append(messages, map[string]any{"role": "system", "content": ins})
 	}
-	for _, it := range asArr(in["input"]) {
-		item := asMap(it)
-		switch asStr(item["type"]) {
-		case "function_call":
-			id := getStr(item, "call_id")
-			if id == "" {
-				id = getStr(item, "id")
-			}
-			args := asStr(item["arguments"])
-			if args == "" {
-				args = "{}"
-			}
-			messages = append(messages, map[string]any{
-				"role": "assistant", "content": nil,
-				"tool_calls": []any{map[string]any{
-					"id": id, "type": "function",
-					"function": map[string]any{"name": getStr(item, "name"), "arguments": args},
-				}},
-			})
-		case "function_call_output":
-			var output any = ""
-			if s, ok := item["output"].(string); ok {
-				output = s
-			} else if item["output"] != nil {
-				output = canon(item["output"])
-			}
-			messages = append(messages, map[string]any{
-				"role": "tool", "tool_call_id": getStr(item, "call_id"), "content": output,
-			})
-		case "reasoning":
-			var sb strings.Builder
-			for _, s := range asArr(item["summary"]) {
-				if asStr(asMap(s)["type"]) == "summary_text" {
-					sb.WriteString(asStr(asMap(s)["text"]))
+	if s, ok := in["input"].(string); ok {
+		// responses 允许 input 为纯字符串。
+		if s != "" {
+			messages = append(messages, map[string]any{"role": "user", "content": s})
+		}
+	} else {
+		for _, it := range asArr(in["input"]) {
+			item := asMap(it)
+			switch asStr(item["type"]) {
+			case "function_call":
+				id := getStr(item, "call_id")
+				if id == "" {
+					id = getStr(item, "id")
 				}
-			}
-			if sb.Len() > 0 {
+				args := asStr(item["arguments"])
+				if args == "" {
+					args = "{}"
+				}
 				messages = append(messages, map[string]any{
-					"role": "assistant", "content": nil, "reasoning_content": sb.String(),
+					"role": "assistant", "content": nil,
+					"tool_calls": []any{map[string]any{
+						"id": id, "type": "function",
+						"function": map[string]any{"name": getStr(item, "name"), "arguments": args},
+					}},
 				})
-			}
-		default:
-			role := asStr(item["role"])
-			if role == "" {
-				continue
-			}
-			if role == "system" {
-				messages = append(messages, map[string]any{"role": "system", "content": textOfContent(item["content"])})
-				continue
-			}
-			var parts []any
-			if s, ok := item["content"].(string); ok {
-				if s != "" {
-					parts = append(parts, map[string]any{"type": "text", "text": s})
+			case "function_call_output":
+				var output any = ""
+				if s, ok := item["output"].(string); ok {
+					output = s
+				} else if item["output"] != nil {
+					output = canon(item["output"])
 				}
-			} else {
-				for _, p := range asArr(item["content"]) {
-					pm := asMap(p)
-					switch asStr(pm["type"]) {
-					case "input_text", "output_text", "text":
-						if t := asStr(pm["text"]); t != "" {
-							parts = append(parts, map[string]any{"type": "text", "text": t})
-						}
-					case "input_image":
-						if u := asStr(pm["image_url"]); u != "" {
-							parts = append(parts, map[string]any{"type": "image_url", "image_url": map[string]any{"url": u}})
+				messages = append(messages, map[string]any{
+					"role": "tool", "tool_call_id": getStr(item, "call_id"), "content": output,
+				})
+			case "reasoning":
+				var sb strings.Builder
+				for _, s := range asArr(item["summary"]) {
+					if asStr(asMap(s)["type"]) == "summary_text" {
+						sb.WriteString(asStr(asMap(s)["text"]))
+					}
+				}
+				if sb.Len() > 0 {
+					messages = append(messages, map[string]any{
+						"role": "assistant", "content": nil, "reasoning_content": sb.String(),
+					})
+				}
+			default:
+				role := asStr(item["role"])
+				if role == "" {
+					continue
+				}
+				if role == "system" {
+					messages = append(messages, map[string]any{"role": "system", "content": textOfContent(item["content"])})
+					continue
+				}
+				var parts []any
+				if s, ok := item["content"].(string); ok {
+					if s != "" {
+						parts = append(parts, map[string]any{"type": "text", "text": s})
+					}
+				} else {
+					for _, p := range asArr(item["content"]) {
+						pm := asMap(p)
+						switch asStr(pm["type"]) {
+						case "input_text", "output_text", "text":
+							if t := asStr(pm["text"]); t != "" {
+								parts = append(parts, map[string]any{"type": "text", "text": t})
+							}
+						case "input_image":
+							if u := asStr(pm["image_url"]); u != "" {
+								parts = append(parts, map[string]any{"type": "image_url", "image_url": map[string]any{"url": u}})
+							}
 						}
 					}
 				}
+				content := any(nil)
+				if len(parts) == 1 && asStr(asMap(parts[0])["type"]) == "text" {
+					content = asStr(asMap(parts[0])["text"])
+				} else if len(parts) > 0 {
+					content = parts
+				}
+				messages = append(messages, map[string]any{"role": role, "content": content})
 			}
-			content := any(nil)
-			if len(parts) == 1 && asStr(asMap(parts[0])["type"]) == "text" {
-				content = asStr(asMap(parts[0])["text"])
-			} else if len(parts) > 0 {
-				content = parts
-			}
-			messages = append(messages, map[string]any{"role": role, "content": content})
 		}
 	}
 	if messages == nil {
@@ -848,62 +855,67 @@ func responsesToMessagesReq(in map[string]any) map[string]any {
 		pendingRole = role
 		pendingBlocks = append(pendingBlocks, map[string]any{"type": "text", "text": text})
 	}
-	for _, it := range asArr(in["input"]) {
-		item := asMap(it)
-		switch asStr(item["type"]) {
-		case "function_call":
-			flushPending()
-			id := getStr(item, "call_id")
-			if id == "" {
-				id = getStr(item, "id")
-			}
-			messages = append(messages, map[string]any{
-				"role": "assistant",
-				"content": []any{map[string]any{
-					"type": "tool_use", "id": id,
-					"name": getStr(item, "name"), "input": parseObj(asStr(item["arguments"])),
-				}},
-			})
-		case "function_call_output":
-			flushPending()
-			var c any = asStr(item["output"])
-			if _, ok := item["output"].(string); !ok && item["output"] != nil {
-				c = []any{map[string]any{"type": "text", "text": canon(item["output"])}}
-			}
-			messages = append(messages, map[string]any{
-				"role": "user",
-				"content": []any{map[string]any{
-					"type": "tool_result", "tool_use_id": getStr(item, "call_id"), "content": c,
-				}},
-			})
-		case "reasoning":
-			// 丢弃（同 messages 原生 thinking 处理）。
-		default:
-			role := asStr(item["role"])
-			if role == "" {
-				continue
-			}
-			if role == "system" {
-				continue
-			}
-			if s, ok := item["content"].(string); ok {
-				pushText(role, s)
-				continue
-			}
-			for _, p := range asArr(item["content"]) {
-				pm := asMap(p)
-				switch asStr(pm["type"]) {
-				case "input_text", "output_text", "text":
-					pushText(role, asStr(pm["text"]))
-				case "input_image":
-					flushPending()
-					if u := asStr(pm["image_url"]); u != "" {
-						messages = append(messages, map[string]any{
-							"role": role,
-							"content": []any{map[string]any{
-								"type": "image", "source": dataURLToImageSource(u),
-							}},
-						})
+	if s, ok := in["input"].(string); ok {
+		// responses 允许 input 为纯字符串。
+		pushText("user", s)
+	} else {
+		for _, it := range asArr(in["input"]) {
+			item := asMap(it)
+			switch asStr(item["type"]) {
+			case "function_call":
+				flushPending()
+				id := getStr(item, "call_id")
+				if id == "" {
+					id = getStr(item, "id")
+				}
+				messages = append(messages, map[string]any{
+					"role": "assistant",
+					"content": []any{map[string]any{
+						"type": "tool_use", "id": id,
+						"name": getStr(item, "name"), "input": parseObj(asStr(item["arguments"])),
+					}},
+				})
+			case "function_call_output":
+				flushPending()
+				var c any = asStr(item["output"])
+				if _, ok := item["output"].(string); !ok && item["output"] != nil {
+					c = []any{map[string]any{"type": "text", "text": canon(item["output"])}}
+				}
+				messages = append(messages, map[string]any{
+					"role": "user",
+					"content": []any{map[string]any{
+						"type": "tool_result", "tool_use_id": getStr(item, "call_id"), "content": c,
+					}},
+				})
+			case "reasoning":
+				// 丢弃（同 messages 原生 thinking 处理）。
+			default:
+				role := asStr(item["role"])
+				if role == "" {
+					continue
+				}
+				if role == "system" {
+					continue
+				}
+				if s, ok := item["content"].(string); ok {
+					pushText(role, s)
+					continue
+				}
+				for _, p := range asArr(item["content"]) {
+					pm := asMap(p)
+					switch asStr(pm["type"]) {
+					case "input_text", "output_text", "text":
+						pushText(role, asStr(pm["text"]))
+					case "input_image":
+						flushPending()
+						if u := asStr(pm["image_url"]); u != "" {
+							messages = append(messages, map[string]any{
+								"role": role,
+								"content": []any{map[string]any{
+									"type": "image", "source": dataURLToImageSource(u),
+								}},
+							})
+						}
 					}
 				}
 			}
