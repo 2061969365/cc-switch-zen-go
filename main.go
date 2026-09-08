@@ -45,6 +45,19 @@ import (
 
 const zenUA = "opencode/1.18.18"
 
+// P0-1：上游共享连接池+超时。http.DefaultClient 无限等，上游 hang 住会拖死网关。
+// zenClient 用于非流式（总超时 600s）；zenStreamClient 用于 SSE/透传（长连接，无总超时）。
+var zenTransport = &http.Transport{
+	MaxIdleConnsPerHost:   20,
+	IdleConnTimeout:       90 * time.Second,
+	TLSHandshakeTimeout:   30 * time.Second,
+	ResponseHeaderTimeout: 60 * time.Second,
+}
+
+var zenClient = &http.Client{Transport: zenTransport, Timeout: 600 * time.Second}
+
+var zenStreamClient = &http.Client{Transport: zenTransport}
+
 func env(key, def string) string {
 	if v := os.Getenv(key); v != "" {
 		return v
@@ -98,6 +111,8 @@ func main() {
 	proxy := &httputil.ReverseProxy{
 		// SSE 流式必需：禁用缓冲，逐块刷给客户端。
 		FlushInterval: -1,
+		// P0-1：透传可能也是 SSE，用无总超时的共享传输层。
+		Transport: zenTransport,
 		Director: func(req *http.Request) {
 			upstreamPath, ok := routes[req.URL.Path]
 			if !ok {
@@ -158,7 +173,8 @@ func main() {
 	log.Printf("zen-go headless 监听 %s，上游 %s", addr, zenBase.String())
 	seedBuiltinTable()
 	go refreshTableFromOfficial()
-	log.Fatal(http.ListenAndServe(addr, mux))
+	// P0-3：全入口请求体上限 200MB（/conv 内部另有更严的 32MB）。
+	log.Fatal(http.ListenAndServe(addr, http.MaxBytesHandler(mux, 200<<20)))
 }
 
 func setDefault(h http.Header, key, value string) {
@@ -214,7 +230,7 @@ func convHandlerInner(w http.ResponseWriter, req *http.Request, inner string, ze
 			return
 		}
 		setZenHeaders(fwd.Header, apiKey, project)
-		resp, err := http.DefaultClient.Do(fwd)
+		resp, err := zenClient.Do(fwd)
 		if err != nil {
 			writeConvError(w, http.StatusBadGateway, "upstream unreachable")
 			return
@@ -222,7 +238,7 @@ func convHandlerInner(w http.ResponseWriter, req *http.Request, inner string, ze
 		defer resp.Body.Close()
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(resp.StatusCode)
-		_, _ = io.Copy(w, resp.Body)
+		_, _ = io.Copy(w, io.LimitReader(resp.Body, 64<<20))
 		return
 	}
 	inFmt := convInputFormat(inner)
@@ -293,7 +309,12 @@ func convHandlerInner(w http.ResponseWriter, req *http.Request, inner string, ze
 	}
 	setZenHeaders(fwd.Header, apiKey, project)
 	fwd.Header.Set("Content-Type", "application/json")
-	resp, err := http.DefaultClient.Do(fwd)
+	// P0-1：流式用无总超时的 client，非流式用 600s 总超时。
+	upstreamClient := zenClient
+	if stream {
+		upstreamClient = zenStreamClient
+	}
+	resp, err := upstreamClient.Do(fwd)
 	if err != nil {
 		writeConvError(w, http.StatusBadGateway, "upstream unreachable")
 		return
@@ -301,10 +322,10 @@ func convHandlerInner(w http.ResponseWriter, req *http.Request, inner string, ze
 	defer resp.Body.Close()
 	log.Printf("CONV %s %s -> %s 上游 %d", inner, model, target.upstreamPath(), resp.StatusCode)
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		// 上游错误原样透传，不转换。
+		// 上游错误原样透传，不转换（P0-2：错误体同样限流）。
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(resp.StatusCode)
-		_, _ = io.Copy(w, resp.Body)
+		_, _ = io.Copy(w, io.LimitReader(resp.Body, 64<<20))
 		return
 	}
 	if stream {
@@ -330,7 +351,8 @@ func convHandlerInner(w http.ResponseWriter, req *http.Request, inner string, ze
 		return
 	}
 	var upResp map[string]any
-	if err := json.NewDecoder(resp.Body).Decode(&upResp); err != nil {
+	// P0-2：非流式全量进内存，限 64MB 防 OOM。
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 64<<20)).Decode(&upResp); err != nil {
 		writeConvError(w, http.StatusBadGateway, "decode upstream response: "+err.Error())
 		return
 	}

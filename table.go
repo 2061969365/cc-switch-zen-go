@@ -13,6 +13,7 @@ import (
 	"os"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -40,7 +41,11 @@ func (f Format) upstreamPath() string {
 }
 
 // modelTable 精确模型 ID -> 格式。启动时先装内置快照，再用官网刷新增补。
+// P0-4：refreshTableFromOfficial 在后台 goroutine 写 map，lookupFormat 并发读，
+// 无锁会 concurrent map writes 崩进程，故加 RWMutex。
 var modelTable = map[string]Format{}
+
+var tableMu sync.RWMutex
 
 // 内置快照：官网 zen 文档 2026-09-07。前缀规则见 guessFormatByPrefix。
 func seedBuiltinTable() {
@@ -113,7 +118,10 @@ func guessFormatByPrefix(model string) Format {
 
 // lookupFormat 查模型所需格式。ok=false 表示未知模型（调用方决定透传）。
 func lookupFormat(model string) (Format, bool) {
-	if f, ok := modelTable[model]; ok {
+	tableMu.RLock()
+	f, ok := modelTable[model]
+	tableMu.RUnlock()
+	if ok {
 		return f, true
 	}
 	if f := guessFormatByPrefix(model); f != "" {
@@ -165,6 +173,7 @@ func refreshTableFromOfficial() {
 		return
 	}
 	n := 0
+	tableMu.Lock()
 	for _, line := range strings.Split(string(body), "\n") {
 		m := mdxRowRe.FindStringSubmatch(strings.TrimSpace(line))
 		if m == nil {
@@ -175,5 +184,7 @@ func refreshTableFromOfficial() {
 			n++
 		}
 	}
-	log.Printf("映射表刷新：官网解析 %d 个模型，当前共 %d 个", n, len(modelTable))
+	total := len(modelTable)
+	tableMu.Unlock()
+	log.Printf("映射表刷新：官网解析 %d 个模型，当前共 %d 个", n, total)
 }
