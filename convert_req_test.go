@@ -25,7 +25,7 @@ func TestFilterPrivateParams(t *testing.T) {
 		t.Errorf("嵌套 _a 未删")
 	}
 	// properties 下划线 key 豁免。
-	props := asMap(asMap(asMap(asMap(out["tools"]).([]any)[0])["function"])["parameters"])["properties"]
+	props := asMap(asMap(asMap(asArr(out["tools"])[0])["function"])["parameters"])["properties"]
 	if _, found := props["_keep"]; !found {
 		t.Errorf("properties 下 _keep 应保留")
 	}
