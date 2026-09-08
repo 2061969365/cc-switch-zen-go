@@ -131,3 +131,57 @@ func TestMediaPlaceholderInConverters(t *testing.T) {
 		t.Errorf("arguments 未 canonical: %s", got)
 	}
 }
+
+func TestStripOneMSuffix(t *testing.T) {
+	cases := map[string]string{
+		"claude-sonnet-4-5[1M]": "claude-sonnet-4-5",
+		"gpt-5[1m]":             "gpt-5",
+		"mimo-v2.5-free":        "mimo-v2.5-free",
+		"m[1M]m":                "m[1M]m",
+		"claude-x[1M] ":         "claude-x",
+		"":                      "",
+	}
+	for in, want := range cases {
+		if got := stripOneMSuffix(in); got != want {
+			t.Errorf("%q: got %q want %q", in, got, want)
+		}
+	}
+}
+
+func TestEnsureMessagesDefaults(t *testing.T) {
+	// 缺 max_tokens 补 8192。
+	u := mustJSON(t, `{"model":"m","messages":[]}`)
+	ensureMessagesDefaults(u)
+	if toFloat(u["max_tokens"]) != 8192 {
+		t.Errorf("应补 8192，得 %v", u["max_tokens"])
+	}
+	// 已有不覆盖。
+	u2 := mustJSON(t, `{"model":"m","max_tokens":100}`)
+	ensureMessagesDefaults(u2)
+	if toFloat(u2["max_tokens"]) != 100 {
+		t.Errorf("不应覆盖，得 %v", u2["max_tokens"])
+	}
+	// thinking budget 过小矫正。
+	u3 := mustJSON(t, `{"model":"m","max_tokens":64000,
+		"thinking":{"type":"enabled","budget_tokens":512}}`)
+	ensureMessagesDefaults(u3)
+	if toFloat(asMap(u3["thinking"])["budget_tokens"]) != 32000 {
+		t.Errorf("budget 应矫为 32000，得 %v", asMap(u3["thinking"])["budget_tokens"])
+	}
+	// budget>=max_tokens 时 max_tokens 最小抬升。
+	u4 := mustJSON(t, `{"model":"m","max_tokens":2000,
+		"thinking":{"type":"enabled","budget_tokens":5000}}`)
+	ensureMessagesDefaults(u4)
+	if toFloat(asMap(u4["thinking"])["budget_tokens"]) != 5000 {
+		t.Errorf("合法 budget 不应动")
+	}
+	if toFloat(u4["max_tokens"]) != 6024 {
+		t.Errorf("max 应抬为 6024，得 %v", u4["max_tokens"])
+	}
+	// disabled 不动。
+	u5 := mustJSON(t, `{"model":"m","thinking":{"type":"disabled"}}`)
+	ensureMessagesDefaults(u5)
+	if _, found := asMap(u5["thinking"])["budget_tokens"]; found {
+		t.Errorf("disabled 不应加 budget")
+	}
+}

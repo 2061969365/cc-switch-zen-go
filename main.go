@@ -286,10 +286,14 @@ func convHandlerInner(w http.ResponseWriter, req *http.Request, inner string, ze
 		writeConvError(w, http.StatusBadRequest, "missing model")
 		return
 	}
+	// P2a-1：剥离 [1M] 后缀（Claude Code 上下文标记，上游不认），写回 in 让各转换/透传统一。
+	model = stripOneMSuffix(model)
+	in["model"] = model
 	if t, ok := lookupFormat(model); ok {
 		target = t
 	} else {
-		target = inFmt // 未知模型：透传碰运气
+		// P2a-3：未知模型默认走 chat（cc-switch 同款），不再原端点碰运气。
+		target = FmtChat
 	}
 	if target == FmtGemini {
 		writeConvError(w, http.StatusBadRequest, "gemini models use /v1/models/<id>, /conv cannot convert")
@@ -319,6 +323,9 @@ func convHandlerInner(w http.ResponseWriter, req *http.Request, inner string, ze
 	} else if inFmt == FmtMessages {
 		// P1b-7：messages 同格式透传：清理多轮带回的杂散 signature 与顶层 thinking。
 		stripThinkingSignature(in)
+	}
+	if target == FmtMessages {
+		ensureMessagesDefaults(upReq)
 	}
 	if stream && inFmt == FmtChat {
 		// chat 流式默认不带 usage，强制加上，终态转换需要它。

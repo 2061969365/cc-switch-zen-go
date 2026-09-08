@@ -1068,6 +1068,39 @@ func responsesToolChoiceToChat(tc any) any {
 	return tc
 }
 
+// clampThinkingBudget 矫正 messages 请求的 thinking budget（P2a-4）。
+// 上游约束：budget>=1024 且 budget<max_tokens，否则必 400。缺 max_tokens
+// 时按 8192 兜底判断；budget 越界时优先保 budget 合法，max_tokens 做最小抬升。
+func clampThinkingBudget(upReq map[string]any) {
+	th, ok := upReq["thinking"].(map[string]any)
+	if !ok || asStr(th["type"]) == "disabled" {
+		return
+	}
+	maxTok := int(toFloat(upReq["max_tokens"]))
+	if maxTok <= 0 {
+		maxTok = 8192
+	}
+	budget := int(toFloat(th["budget_tokens"]))
+	if budget < 1024 {
+		budget = 32000
+	}
+	if budget >= maxTok {
+		maxTok = budget + 1024
+		upReq["max_tokens"] = maxTok
+	}
+	th["budget_tokens"] = budget
+}
+
+// ensureMessagesDefaults messages 目标发上游前的兜底（P2a-2/P2a-4）。
+func ensureMessagesDefaults(upReq map[string]any) {
+	// P2a-2：上游 Anthropic 要求 max_tokens 必填，缺省补 8192（cc-switch 同款）。
+	if _, ok := upReq["max_tokens"]; !ok {
+		upReq["max_tokens"] = 8192
+	}
+	// P2a-4：thinking budget 越界必 400，发前矫正。
+	clampThinkingBudget(upReq)
+}
+
 // sanitizeResponsesInput 清洗 responses 输入中的回传条目。
 //
 // 背景：网关转出的 responses 响应里 reasoning/function_call 用的是现编 ID

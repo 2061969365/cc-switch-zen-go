@@ -116,6 +116,17 @@ func guessFormatByPrefix(model string) Format {
 	return ""
 }
 
+// stripOneMSuffix 剥离模型名尾部 [1M]/[1m] 上下文标记（P2a-1）。
+// Claude Code 会发 claude-xxx[1M]，上游不认，原样透传必 400 model_not_found。
+// 参照 cc-switch model_mapper.rs:149-172。
+func stripOneMSuffix(model string) string {
+	m := strings.TrimSpace(model)
+	if strings.HasSuffix(strings.ToLower(m), "[1m]") {
+		m = strings.TrimSpace(m[:len(m)-len("[1m]")])
+	}
+	return m
+}
+
 // lookupFormat 查模型所需格式。ok=false 表示未知模型（调用方决定透传）。
 func lookupFormat(model string) (Format, bool) {
 	tableMu.RLock()
