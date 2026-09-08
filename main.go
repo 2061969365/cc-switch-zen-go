@@ -257,20 +257,41 @@ func convHandlerInner(w http.ResponseWriter, req *http.Request, inner string, ze
 		writeConvError(w, http.StatusBadRequest, "invalid json: "+err.Error())
 		return
 	}
-	model := getStr(in, "model")
+	// P1b-10：请求级 reqID + 分段计时。流式只量到响应头（io.Copy 会阻塞到流结束）。
+	t0 := time.Now()
+	reqID := randHex(8)
+	var model string
+	var stream bool
+	var target Format
+	var tRead, tConv1, tUp, tDec, tConv2 time.Time
+	var upStatus int
+	defer func() {
+		ms := func(t time.Time) int64 {
+			if t.IsZero() {
+				return -1
+			}
+			return t.Sub(t0).Milliseconds()
+		}
+		log.Printf("[REQ %s] %s model=%s stream=%v in=%s out=%s up=%d read=%dms conv1=%dms up=%dms dec=%dms conv2=%dms total=%dms",
+			reqID, inner, model, stream, inFmt, target, upStatus,
+			ms(tRead), ms(tConv1), ms(tUp), ms(tDec), ms(tConv2), time.Since(t0).Milliseconds())
+	}()
+	tRead = time.Now()
+	model = getStr(in, "model")
 	if model == "" {
 		writeConvError(w, http.StatusBadRequest, "missing model")
 		return
 	}
-	target, ok := lookupFormat(model)
-	if !ok {
+	if t, ok := lookupFormat(model); ok {
+		target = t
+	} else {
 		target = inFmt // 未知模型：透传碰运气
 	}
 	if target == FmtGemini {
 		writeConvError(w, http.StatusBadRequest, "gemini models use /v1/models/<id>, /conv cannot convert")
 		return
 	}
-	stream := asBool(in["stream"])
+	stream = asBool(in["stream"])
 	upReq := in
 	if target != inFmt {
 		switch {
@@ -296,6 +317,7 @@ func convHandlerInner(w http.ResponseWriter, req *http.Request, inner string, ze
 		// chat 流式默认不带 usage，强制加上，终态转换需要它。
 		upReq["stream_options"] = map[string]any{"include_usage": true}
 	}
+	tConv1 = time.Now()
 	upBody, err := json.Marshal(upReq)
 	if err != nil {
 		writeConvError(w, http.StatusBadRequest, "encode upstream request: "+err.Error())
@@ -321,12 +343,11 @@ func convHandlerInner(w http.ResponseWriter, req *http.Request, inner string, ze
 		return
 	}
 	defer resp.Body.Close()
-	log.Printf("CONV %s %s -> %s 上游 %d", inner, model, target.upstreamPath(), resp.StatusCode)
+	tUp = time.Now()
+	upStatus = resp.StatusCode
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		// 上游错误原样透传，不转换（P0-2：错误体同样限流）。
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(resp.StatusCode)
-		_, _ = io.Copy(w, io.LimitReader(resp.Body, 64<<20))
+		// P1b-9：按客户端协议包规范 error envelope，不再原样透传。
+		writeUpstreamError(w, inFmt, resp.StatusCode, resp.Body)
 		return
 	}
 	if stream {
@@ -357,6 +378,7 @@ func convHandlerInner(w http.ResponseWriter, req *http.Request, inner string, ze
 		writeConvError(w, http.StatusBadGateway, "decode upstream response: "+err.Error())
 		return
 	}
+	tDec = time.Now()
 	out := upResp
 	if target != inFmt {
 		switch {
@@ -374,9 +396,55 @@ func convHandlerInner(w http.ResponseWriter, req *http.Request, inner string, ze
 			out = messagesToResponsesResp(upResp, model)
 		}
 	}
+	tConv2 = time.Now()
 	w.Header().Set("Content-Type", "application/json")
 	enc := json.NewEncoder(w)
 	_ = enc.Encode(out)
+}
+
+// P1b-9：上游非 2xx 按客户端协议包规范 error envelope（保留状态码），
+// 避免 HTML/空体/异构 JSON 穿透搞崩客户端解析。错误体截前 500 字，
+// 若上游已是规范形状则透传其 message。
+func writeUpstreamError(w http.ResponseWriter, inFmt Format, status int, r io.Reader) {
+	raw, _ := io.ReadAll(io.LimitReader(r, 64<<20))
+	msg := strings.TrimSpace(string(raw))
+	if msg == "" {
+		msg = http.StatusText(status)
+	}
+	if m := parseSSEData(msg); m != nil {
+		if em := extractUpstreamMsg(m); em != "" {
+			msg = em
+		}
+	}
+	if len(msg) > 500 {
+		msg = msg[:500] + "…"
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	var out map[string]any
+	switch inFmt {
+	case FmtMessages:
+		out = map[string]any{"type": "error",
+			"error": map[string]any{"type": "api_error", "message": msg}}
+	case FmtChat:
+		out = map[string]any{"error": map[string]any{"message": msg, "type": "upstream_error", "code": status}}
+	default: // FmtResponses
+		out = map[string]any{"error": map[string]any{"message": msg, "type": "upstream_error", "code": status}}
+	}
+	b, _ := json.Marshal(out)
+	_, _ = w.Write(b)
+}
+
+func extractUpstreamMsg(m map[string]any) string {
+	if e, ok := m["error"].(map[string]any); ok {
+		if s, ok := e["message"].(string); ok && s != "" {
+			return s
+		}
+	}
+	if s, ok := m["message"].(string); ok && s != "" {
+		return s
+	}
+	return ""
 }
 
 func asBool(v any) bool {
