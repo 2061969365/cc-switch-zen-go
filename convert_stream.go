@@ -86,6 +86,7 @@ func (s *sseSink) done() {
 // handler(event, data)：event 对 chat/responses 为 ""，anthropic 为事件名；data=="[DONE]" 表结束。
 func pumpSSE(r io.Reader, handler func(event, data string)) {
 	var buf []byte
+	var pend []byte // 上一块尾部悬空的 \r（\r\n 被读边界切开时）
 	tmp := make([]byte, 32*1024)
 	flush := func(final bool) {
 		for {
@@ -105,11 +106,23 @@ func pumpSSE(r io.Reader, handler func(event, data string)) {
 	}
 	for {
 		n, err := r.Read(tmp)
-		if n > 0 {
-			buf = append(buf, tmp[:n]...)
+		chunk := tmp[:n]
+		if len(pend) > 0 {
+			chunk = append(append([]byte{}, pend...), chunk...)
+			pend = nil
+		}
+		if err == nil && len(chunk) > 0 && chunk[len(chunk)-1] == '\r' {
+			pend = []byte{'\r'}
+			chunk = chunk[:len(chunk)-1]
+		}
+		if len(chunk) > 0 {
+			// SSE 行尾归一化：\r\n → \n（JSON 串内不允许裸回车，安全）。
+			buf = append(buf, bytes.ReplaceAll(chunk, []byte("\r\n"), []byte("\n"))...)
 			flush(false)
 		}
 		if err != nil {
+			buf = append(buf, pend...)
+			pend = nil
 			flush(true)
 			return
 		}
