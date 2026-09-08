@@ -494,9 +494,9 @@ func streamChatToMessages(w http.ResponseWriter, r io.Reader, model string) {
 	var usage map[string]any
 	var stop string
 	finished := false
-	sawFinish := false // 是否见过上游 finish_reason
+	sawFinish := false    // 是否见过上游 finish_reason
 	finishIsTool := false // finish_reason 是否为工具调用（P2b-7 丢光判定用）
-	hasOutput := false // 是否有实质输出
+	hasOutput := false    // 是否有实质输出
 
 	ensureStart := func() {
 		if started {
