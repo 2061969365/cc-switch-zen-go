@@ -234,7 +234,7 @@ func TestP2bChatToMessagesToolDroppedFailed(t *testing.T) {
 	if !strings.Contains(body, "upstream tool call dropped") {
 		t.Errorf("丢光应 failed:\n%s", body)
 	}
-	if strings.Contains(body, `"stop_reason"`) {
+	if strings.Contains(body, "event: message_delta") {
 		t.Errorf("failed 不应补 message_delta:\n%s", body)
 	}
 }
@@ -288,9 +288,9 @@ func TestP2bMessagesToResponsesToolFallbackID(t *testing.T) {
 }
 
 func TestP2bNonStreamToolFallbackIDs(t *testing.T) {
-	// responses->chat：双空 id。
+	// responses->chat：双空 id（返回 chat envelope，经 choices 导航）。
 	out := responsesToChatResp(mustJSON(t, `{"output":[{"type":"function_call","name":"f","arguments":"{}"}]}`), "m")
-	tc := asMap(asArr(asMap(asArr(out["messages"])[0])["tool_calls"])[0])
+	tc := asMap(asArr(asMap(asMap(asArr(out["choices"])[0])["message"])["tool_calls"])[0])
 	if got := getStr(tc, "id"); got == "" {
 		t.Errorf("responses->chat 空 id 未 fallback")
 	}
