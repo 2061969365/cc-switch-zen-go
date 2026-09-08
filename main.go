@@ -48,7 +48,8 @@ const zenUA = "opencode/1.18.18"
 // P0-1：上游共享连接池+超时。http.DefaultClient 无限等，上游 hang 住会拖死网关。
 // zenClient 用于非流式（总超时 600s）；zenStreamClient 用于 SSE/透传（长连接，无总超时）。
 var zenTransport = &http.Transport{
-	MaxIdleConnsPerHost:   20,
+	Proxy:               http.ProxyFromEnvironment, // 认 HTTP(S)_PROXY/NO_PROXY
+	MaxIdleConnsPerHost: 20,
 	IdleConnTimeout:       90 * time.Second,
 	TLSHandshakeTimeout:   30 * time.Second,
 	ResponseHeaderTimeout: 60 * time.Second,
