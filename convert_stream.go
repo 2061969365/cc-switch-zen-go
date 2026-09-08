@@ -196,6 +196,11 @@ func streamChatToResponses(w http.ResponseWriter, r io.Reader, model string) {
 			return
 		}
 		finished = true
+		// P2b-7：上游宣称工具调用却零 tool 增量 → failed，不撒谎报 completed。
+		if (finish == "tool_calls" || finish == "function_call") && len(order) == 0 {
+			sink.emitResponsesFailed(respID, model, "upstream tool call dropped")
+			return
+		}
 		var output []any
 		if t := text.String(); t != "" {
 			output = append(output, map[string]any{"type": "message", "role": "assistant",
@@ -203,6 +208,11 @@ func streamChatToResponses(w http.ResponseWriter, r io.Reader, model string) {
 		}
 		for _, idx := range order {
 			t := tools[idx]
+			// P2b-7：id/name 不全的工具给 fallback 保底，不丢弃。
+			t.callID = fallbackToolID(t.callID, idx)
+			if t.name == "" {
+				t.name = "unknown_tool"
+			}
 			output = append(output, map[string]any{"type": "function_call",
 				"id": "fc_" + t.callID, "call_id": t.callID, "name": t.name, "arguments": t.args.String()})
 		}
@@ -215,9 +225,8 @@ func streamChatToResponses(w http.ResponseWriter, r io.Reader, model string) {
 		}
 		ev := map[string]any{"type": "response.completed",
 			"response": map[string]any{"id": respID, "status": status, "output": output}}
-		if len(usage) > 0 {
-			ev["response"].(map[string]any)["usage"] = responsesUsageFromChat(usage)
-		}
+		// P2b-5：usage 常带（零值兜底），Codex/opencode 强读 usage.input_tokens。
+		ev["response"].(map[string]any)["usage"] = responsesUsageFromChat(usage)
 		sink.emit(ev)
 	}
 
@@ -486,6 +495,7 @@ func streamChatToMessages(w http.ResponseWriter, r io.Reader, model string) {
 	var stop string
 	finished := false
 	sawFinish := false // 是否见过上游 finish_reason
+	finishIsTool := false // finish_reason 是否为工具调用（P2b-7 丢光判定用）
 	hasOutput := false // 是否有实质输出
 
 	ensureStart := func() {
@@ -517,9 +527,29 @@ func streamChatToMessages(w http.ResponseWriter, r io.Reader, model string) {
 		}
 		ensureStart()
 		closeText()
+		startedTools := 0
 		for _, idx := range sortedKeys(tools) {
 			t := tools[idx]
+			if !t.started {
+				// P2b-7：id/name 不全导致未开块的工具，有信号就 fallback 开块，不静默丢。
+				if t.id == "" && t.name == "" && t.pending.Len() == 0 {
+					continue
+				}
+				t.id = fallbackToolID(t.id, idx)
+				if t.name == "" {
+					t.name = "unknown_tool"
+				}
+				t.started = true
+				sink.emit(map[string]any{"type": "content_block_start", "index": t.aIdx,
+					"content_block": map[string]any{"type": "tool_use", "id": t.id, "name": t.name, "input": map[string]any{}}})
+				if p := t.pending.String(); p != "" {
+					sink.emit(map[string]any{"type": "content_block_delta", "index": t.aIdx,
+						"delta": map[string]any{"type": "input_json_delta", "partial_json": p}})
+					t.pending.Reset()
+				}
+			}
 			if t.started {
+				startedTools++
 				if p := t.pending.String(); p != "" {
 					sink.emit(map[string]any{"type": "content_block_delta", "index": t.aIdx,
 						"delta": map[string]any{"type": "input_json_delta", "partial_json": p}})
@@ -528,11 +558,18 @@ func streamChatToMessages(w http.ResponseWriter, r io.Reader, model string) {
 				sink.emit(map[string]any{"type": "content_block_stop", "index": t.aIdx})
 			}
 		}
+		// P2b-7：上游宣称 tool_use 却零工具开块 → error，不伪造成功尾。
+		if finishIsTool && startedTools == 0 {
+			sink.emitAnthropicError("upstream tool call dropped")
+			sink.emit(map[string]any{"type": "message_stop"})
+			return
+		}
 		if stop == "" {
 			stop = "end_turn"
 		}
 		ev := map[string]any{"type": "message_delta",
-			"delta": map[string]any{"stop_reason": stop}, "usage": map[string]any{"output_tokens": 0}}
+			// P2b-6：回退 usage 形状必全（含 input_tokens），防客户端 NaN。
+			"delta": map[string]any{"stop_reason": stop}, "usage": map[string]any{"input_tokens": 0, "output_tokens": 0}}
 		if len(usage) > 0 {
 			ev["usage"] = anthropicUsageFromChat(usage)
 		}
@@ -557,6 +594,9 @@ func streamChatToMessages(w http.ResponseWriter, r io.Reader, model string) {
 			delta := asMap(cm["delta"])
 			if fr, ok := cm["finish_reason"].(string); ok && fr != "" {
 				sawFinish = true
+				if fr == "tool_calls" || fr == "function_call" {
+					finishIsTool = true
+				}
 				stop = anthropicStopFromFinish(fr, len(tools) > 0)
 			}
 			if t, ok := delta["content"].(string); ok && t != "" {
@@ -783,7 +823,8 @@ func streamResponsesToMessages(w http.ResponseWriter, r io.Reader, model string)
 			}
 		}
 		ev := map[string]any{"type": "message_delta",
-			"delta": map[string]any{"stop_reason": stop}, "usage": map[string]any{"output_tokens": 0}}
+			// P2b-6：回退 usage 形状必全（含 input_tokens），防客户端 NaN。
+			"delta": map[string]any{"stop_reason": stop}, "usage": map[string]any{"input_tokens": 0, "output_tokens": 0}}
 		if len(usage) > 0 {
 			ev["usage"] = anthropicUsageFromResponses(usage)
 		}
@@ -824,13 +865,18 @@ func streamResponsesToMessages(w http.ResponseWriter, r io.Reader, model string)
 				if id == "" {
 					id = getStr(item, "call_id")
 				}
+				// P2b-7：双空给 fallback，Claude 对 tool_use.id 强校验。
+				callID := fallbackToolID(getStr(item, "call_id"), nextIdx)
+				if id == "" {
+					id = callID
+				}
 				idx := nextIdx
 				nextIdx++
 				toolIdxByItem[id] = idx
 				toolStarted[id] = true
 				sink.emit(map[string]any{"type": "content_block_start", "index": idx,
 					"content_block": map[string]any{"type": "tool_use",
-						"id": getStr(item, "call_id"), "name": getStr(item, "name"), "input": map[string]any{}}})
+						"id": callID, "name": getStr(item, "name"), "input": map[string]any{}}})
 			case "reasoning":
 				closeText()
 				ensureStart()
@@ -922,9 +968,8 @@ func streamMessagesToResponses(w http.ResponseWriter, r io.Reader, model string)
 		if detail != nil {
 			ev["response"].(map[string]any)["incomplete_details"] = detail
 		}
-		if len(usage) > 0 {
-			ev["response"].(map[string]any)["usage"] = responsesUsageFromAnthropic(usage)
-		}
+		// P2b-5：usage 常带（零值兜底）。
+		ev["response"].(map[string]any)["usage"] = responsesUsageFromAnthropic(usage)
 		sink.emit(ev)
 		sink.done()
 	}
@@ -969,7 +1014,8 @@ func streamMessagesToResponses(w http.ResponseWriter, r io.Reader, model string)
 			case "tool_use":
 				hasTool = true
 				hasOutput = true
-				callID := getStr(cb, "id")
+				// P2b-7：空 id 给 fallback，不发 "fc_" 裸前缀。
+				callID := fallbackToolID(getStr(cb, "id"), idx)
 				toolCallID[idx] = callID
 				toolItemID = "fc_" + callID
 				toolArgs.Reset()

@@ -134,7 +134,7 @@ func responsesToChatResp(in map[string]any, model string) map[string]any {
 	var texts []string
 	var toolCalls []any
 	var reasoning []string
-	for _, it := range asArr(in["output"]) {
+	for i, it := range asArr(in["output"]) {
 		item := asMap(it)
 		switch asStr(item["type"]) {
 		case "message":
@@ -148,10 +148,8 @@ func responsesToChatResp(in map[string]any, model string) map[string]any {
 				}
 			}
 		case "function_call":
-			id := getStr(item, "call_id")
-			if id == "" {
-				id = getStr(item, "id")
-			}
+			// P2b-7：双空给 fallback，不发空 id。
+			id := fallbackToolID(firstNonEmpty(getStr(item, "call_id"), getStr(item, "id")), i)
 			args := asStr(item["arguments"])
 			if args == "" {
 				args = "{}"
@@ -216,14 +214,15 @@ func chatToResponsesResp(in map[string]any, model string) map[string]any {
 			"content": []any{map[string]any{"type": "output_text", "text": t}},
 		})
 	}
-	for _, tc := range asArr(msg["tool_calls"]) {
+	for i, tc := range asArr(msg["tool_calls"]) {
 		tm := asMap(tc)
 		fn := asMap(tm["function"])
 		args := asStr(fn["arguments"])
 		if args == "" {
 			args = "{}"
 		}
-		id := getStr(tm, "id")
+		// P2b-7：空 id 给 fallback，不发 "fc_" 裸前缀。
+		id := fallbackToolID(getStr(tm, "id"), i)
 		output = append(output, map[string]any{
 			"type": "function_call", "id": "fc_" + id, "call_id": id,
 			"name": getStr(fn, "name"), "arguments": args,
@@ -276,11 +275,12 @@ func chatToMessagesResp(in map[string]any, model string) map[string]any {
 		content = append(content, map[string]any{"type": "text", "text": t})
 	}
 	var toolCalls []any
-	for _, tc := range asArr(msg["tool_calls"]) {
+	for i, tc := range asArr(msg["tool_calls"]) {
 		tm := asMap(tc)
 		fn := asMap(tm["function"])
 		toolCalls = append(toolCalls, map[string]any{
-			"type": "tool_use", "id": getStr(tm, "id"),
+			// P2b-7：空 id 给 fallback，Claude 强校验。
+			"type": "tool_use", "id": fallbackToolID(getStr(tm, "id"), i),
 			"name": getStr(fn, "name"), "input": parseObj(asStr(fn["arguments"])),
 		})
 	}
@@ -304,7 +304,7 @@ func messagesToChatResp(in map[string]any, model string) map[string]any {
 	var texts []string
 	var toolCalls []any
 	var reasoning []string
-	for _, b := range asArr(in["content"]) {
+	for i, b := range asArr(in["content"]) {
 		bm := asMap(b)
 		switch asStr(bm["type"]) {
 		case "text":
@@ -313,7 +313,8 @@ func messagesToChatResp(in map[string]any, model string) map[string]any {
 			reasoning = append(reasoning, asStr(bm["thinking"]))
 		case "tool_use":
 			toolCalls = append(toolCalls, map[string]any{
-				"id": getStr(bm, "id"), "type": "function",
+				// P2b-7：空 id 给 fallback。
+				"id": fallbackToolID(getStr(bm, "id"), i), "type": "function",
 				"function": map[string]any{"name": getStr(bm, "name"), "arguments": canon(bm["input"])},
 			})
 		}
@@ -346,7 +347,7 @@ func messagesToChatResp(in map[string]any, model string) map[string]any {
 func responsesToMessagesResp(in map[string]any, model string) map[string]any {
 	var content []any
 	hasTool := false
-	for _, it := range asArr(in["output"]) {
+	for i, it := range asArr(in["output"]) {
 		item := asMap(it)
 		switch asStr(item["type"]) {
 		case "message":
@@ -365,10 +366,8 @@ func responsesToMessagesResp(in map[string]any, model string) map[string]any {
 			}
 		case "function_call":
 			hasTool = true
-			id := getStr(item, "call_id")
-			if id == "" {
-				id = getStr(item, "id")
-			}
+			// P2b-7：双空给 fallback。
+			id := fallbackToolID(firstNonEmpty(getStr(item, "call_id"), getStr(item, "id")), i)
 			content = append(content, map[string]any{
 				"type": "tool_use", "id": id,
 				"name": getStr(item, "name"), "input": parseObj(asStr(item["arguments"])),
@@ -419,7 +418,7 @@ func messagesToResponsesResp(in map[string]any, model string) map[string]any {
 		}
 		texts = nil
 	}
-	for _, b := range asArr(in["content"]) {
+	for i, b := range asArr(in["content"]) {
 		bm := asMap(b)
 		switch asStr(bm["type"]) {
 		case "text":
@@ -434,7 +433,8 @@ func messagesToResponsesResp(in map[string]any, model string) map[string]any {
 			}
 		case "tool_use":
 			flushText()
-			id := getStr(bm, "id")
+			// P2b-7：空 id 给 fallback，不发 "fc_" 裸前缀。
+			id := fallbackToolID(getStr(bm, "id"), i)
 			args := canon(bm["input"])
 			output = append(output, map[string]any{
 				"type": "function_call", "id": "fc_" + id, "call_id": id,

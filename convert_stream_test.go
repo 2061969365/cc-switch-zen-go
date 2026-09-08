@@ -158,3 +158,169 @@ func TestStreamMessagesToResponsesMaxTokens(t *testing.T) {
 		t.Errorf("应带 incomplete_details:\n%s", body)
 	}
 }
+
+// ---------- P2b：usage 常带 + 工具 id 保底 ----------
+
+func TestP2bChatToResponsesUsageAlwaysPresent(t *testing.T) {
+	// 上游全程无 usage，completed 仍须带零值 usage。
+	up := "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n" +
+		"data: {\"choices\":[{\"finish_reason\":\"stop\"}]}\n\n"
+	rec := httptest.NewRecorder()
+	streamChatToResponses(rec, strings.NewReader(up), "mimo-v2.5-free")
+	body := rec.Body.String()
+	if !strings.Contains(body, `"input_tokens":0`) || !strings.Contains(body, `"total_tokens":0`) {
+		t.Errorf("completed 缺零值 usage:\n%s", body)
+	}
+}
+
+func TestP2bMessagesToResponsesUsageAlwaysPresent(t *testing.T) {
+	up := "event: message_start\ndata: {\"message\":{\"id\":\"m1\",\"model\":\"mm\"}}\n\n" +
+		"event: message_delta\ndata: {\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n" +
+		"event: message_stop\ndata: {}\n\n"
+	rec := httptest.NewRecorder()
+	streamMessagesToResponses(rec, strings.NewReader(up), "muse-spark-1.3")
+	body := rec.Body.String()
+	if !strings.Contains(body, `"input_tokens":0`) {
+		t.Errorf("completed 缺零值 usage:\n%s", body)
+	}
+}
+
+func TestP2bChatToMessagesDeltaUsageComplete(t *testing.T) {
+	up := "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n" +
+		"data: {\"choices\":[{\"finish_reason\":\"stop\"}]}\n\n" +
+		"data: [DONE]\n\n"
+	rec := httptest.NewRecorder()
+	streamChatToMessages(rec, strings.NewReader(up), "mimo-v2.5-free")
+	body := rec.Body.String()
+	if !strings.Contains(body, `"usage":{"input_tokens":0,"output_tokens":0}`) {
+		t.Errorf("message_delta usage 形状不全:\n%s", body)
+	}
+}
+
+func TestP2bResponsesToMessagesDeltaUsageComplete(t *testing.T) {
+	up := "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n" +
+		"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r1\",\"status\":\"completed\"}}\n\n"
+	rec := httptest.NewRecorder()
+	streamResponsesToMessages(rec, strings.NewReader(up), "claude-sonnet-4-5")
+	body := rec.Body.String()
+	if !strings.Contains(body, `"usage":{"input_tokens":0,"output_tokens":0}`) {
+		t.Errorf("message_delta usage 形状不全:\n%s", body)
+	}
+}
+
+func TestP2bChatToMessagesToolFallbackID(t *testing.T) {
+	// tool_calls 有名无 id：终态须 fallback 开块，不静默丢。
+	up := "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"name\":\"f\",\"arguments\":\"{\\\"a\\\":1}\"}}]}}]}\n\n" +
+		"data: {\"choices\":[{\"finish_reason\":\"tool_calls\"}]}\n\n" +
+		"data: [DONE]\n\n"
+	rec := httptest.NewRecorder()
+	streamChatToMessages(rec, strings.NewReader(up), "mimo-v2.5-free")
+	body := rec.Body.String()
+	if !strings.Contains(body, `"id":"call_0"`) {
+		t.Errorf("缺 fallback id:\n%s", body)
+	}
+	if !strings.Contains(body, `"stop_reason":"tool_use"`) {
+		t.Errorf("应 tool_use 收尾:\n%s", body)
+	}
+}
+
+func TestP2bChatToMessagesToolDroppedFailed(t *testing.T) {
+	// finish 宣称 tool_calls 却零 tool 增量：须 error，不伪造成功。
+	up := "data: {\"choices\":[{\"finish_reason\":\"tool_calls\"}]}\n\n" +
+		"data: [DONE]\n\n"
+	rec := httptest.NewRecorder()
+	streamChatToMessages(rec, strings.NewReader(up), "mimo-v2.5-free")
+	body := rec.Body.String()
+	if !strings.Contains(body, "upstream tool call dropped") {
+		t.Errorf("丢光应 failed:\n%s", body)
+	}
+	if strings.Contains(body, `"stop_reason"`) {
+		t.Errorf("failed 不应补 message_delta:\n%s", body)
+	}
+}
+
+func TestP2bResponsesToMessagesToolFallbackID(t *testing.T) {
+	up := "data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"function_call\",\"name\":\"f\"}}\n\n" +
+		"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r1\",\"status\":\"completed\"}}\n\n"
+	rec := httptest.NewRecorder()
+	streamResponsesToMessages(rec, strings.NewReader(up), "claude-sonnet-4-5")
+	body := rec.Body.String()
+	if !strings.Contains(body, `"id":"call_1"`) {
+		t.Errorf("缺 fallback id:\n%s", body)
+	}
+	if strings.Contains(body, `"id":""`) {
+		t.Errorf("不应有空 id:\n%s", body)
+	}
+}
+
+func TestP2bChatToResponsesToolFallbackAndDrop(t *testing.T) {
+	// a. 有名无 id：completed 输出须带 fallback call_id。
+	up := "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":2,\"function\":{\"name\":\"f\",\"arguments\":\"{}\"}}]}}]}\n\n" +
+		"data: {\"choices\":[{\"finish_reason\":\"tool_calls\"}]}\n\n"
+	rec := httptest.NewRecorder()
+	streamChatToResponses(rec, strings.NewReader(up), "mimo-v2.5-free")
+	body := rec.Body.String()
+	if !strings.Contains(body, `"call_id":"call_2"`) {
+		t.Errorf("缺 fallback call_id:\n%s", body)
+	}
+	// b. 宣称 tool 却零增量：failed。
+	rec2 := httptest.NewRecorder()
+	streamChatToResponses(rec2,
+		strings.NewReader("data: {\"choices\":[{\"finish_reason\":\"tool_calls\"}]}\n\n"), "mimo-v2.5-free")
+	if body := rec2.Body.String(); !strings.Contains(body, "upstream tool call dropped") {
+		t.Errorf("丢光应 failed:\n%s", body)
+	}
+}
+
+func TestP2bMessagesToResponsesToolFallbackID(t *testing.T) {
+	up := "event: content_block_start\ndata: {\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"\",\"name\":\"f\"}}\n\n" +
+		"event: message_delta\ndata: {\"delta\":{\"stop_reason\":\"tool_use\"}}\n\n" +
+		"event: message_stop\ndata: {}\n\n"
+	rec := httptest.NewRecorder()
+	streamMessagesToResponses(rec, strings.NewReader(up), "muse-spark-1.3")
+	body := rec.Body.String()
+	if !strings.Contains(body, `"call_id":"call_0"`) {
+		t.Errorf("缺 fallback call_id:\n%s", body)
+	}
+	if strings.Contains(body, `"id":"fc_"`) {
+		t.Errorf("不应有裸 fc_ 前缀:\n%s", body)
+	}
+}
+
+func TestP2bNonStreamToolFallbackIDs(t *testing.T) {
+	// responses->chat：双空 id。
+	out := responsesToChatResp(mustJSON(t, `{"output":[{"type":"function_call","name":"f","arguments":"{}"}]}`), "m")
+	tc := asMap(asArr(asMap(asArr(out["messages"])[0])["tool_calls"])[0])
+	if got := getStr(tc, "id"); got == "" {
+		t.Errorf("responses->chat 空 id 未 fallback")
+	}
+	// chat->responses：空 id。
+	out2 := chatToResponsesResp(mustJSON(t, `{"choices":[{"message":{"role":"assistant","content":null,
+		"tool_calls":[{"type":"function","function":{"name":"f","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}`), "m")
+	if !strings.Contains(canon(out2), `"id":"fc_call_0"`) {
+		t.Errorf("chat->responses 空 id 未 fallback: %s", canon(out2))
+	}
+	// chat->messages：空 id。
+	out3 := chatToMessagesResp(mustJSON(t, `{"choices":[{"message":{"role":"assistant","content":null,
+		"tool_calls":[{"type":"function","function":{"name":"f","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}`), "m")
+	blocks := asArr(out3["content"])
+	if got := getStr(asMap(blocks[0]), "id"); got == "" {
+		t.Errorf("chat->messages 空 id 未 fallback: %s", canon(blocks))
+	}
+	// messages->chat：空 id。
+	out4 := messagesToChatResp(mustJSON(t, `{"content":[{"type":"tool_use","name":"f","input":{}}]}`), "m")
+	mtc := asMap(asArr(asMap(asMap(asArr(out4["choices"])[0])["message"])["tool_calls"])[0])
+	if got := getStr(mtc, "id"); got == "" {
+		t.Errorf("messages->chat 空 id 未 fallback")
+	}
+	// responses->messages：双空 id。
+	out5 := responsesToMessagesResp(mustJSON(t, `{"output":[{"type":"function_call","name":"f","arguments":"{}"}]}`), "m")
+	if got := getStr(asMap(asArr(out5["content"])[0]), "id"); got == "" {
+		t.Errorf("responses->messages 空 id 未 fallback")
+	}
+	// messages->responses：空 id。
+	out6 := messagesToResponsesResp(mustJSON(t, `{"content":[{"type":"tool_use","name":"f","input":{}}]}`), "m")
+	if !strings.Contains(canon(out6), `"call_id":"call_0"`) {
+		t.Errorf("messages->responses 空 id 未 fallback: %s", canon(out6))
+	}
+}

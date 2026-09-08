@@ -197,6 +197,17 @@ func mediaPlaceholder(kind string) map[string]any {
 	return map[string]any{"type": "text", "text": "[unsupported media omitted: " + kind + "]"}
 }
 
+// fallbackToolID 工具 id 缺失时的保底（P2b-7）。Claude 对 tool_use.id 强校验，
+// 空串会导致 input_json 无法归属而报错；用确定性 fallback 保证下游可归属。
+// 注意：只用于响应侧（网关转给客户端的输出）。请求侧不动——上下游的
+// tool_use/tool_result 空 id 配对是自洽的，单边改名反而拆散配对。
+func fallbackToolID(id string, n int) string {
+	if id != "" {
+		return id
+	}
+	return "call_" + itoa(n)
+}
+
 // textOfContent 取 chat content（string 或 parts 数组）里的纯文本。
 func textOfContent(content any) string {
 	if s, ok := content.(string); ok {
