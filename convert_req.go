@@ -109,6 +109,94 @@ func copyPassthrough(dst, src map[string]any, keys ...string) {
 	}
 }
 
+// ---------- P1b 请求清洗 ----------
+
+// filterPrivateParams 递归删除一切 "_" 开头私有字段，防
+// "Extra inputs are not permitted" 400。properties/$defs 下的 key 豁免
+// （schema 字段名可能以下划线开头）。参照 cc-switch body_filter.rs。
+// 返回新结构，不污染输入。
+func filterPrivateParams(v any) any {
+	return filterPrivate(v, false)
+}
+
+func filterPrivate(v any, inSchemaProps bool) any {
+	switch t := v.(type) {
+	case map[string]any:
+		out := map[string]any{}
+		for k, val := range t {
+			if strings.HasPrefix(k, "_") && !inSchemaProps {
+				continue
+			}
+			child := inSchemaProps || k == "properties" || k == "$defs"
+			out[k] = filterPrivate(val, child)
+		}
+		return out
+	case []any:
+		cp := make([]any, len(t))
+		for i, e := range t {
+			cp[i] = filterPrivate(e, inSchemaProps)
+		}
+		return cp
+	default:
+		return v
+	}
+}
+
+// canonicalArguments arguments 统一 canonical：空/非法/非对象一律 "{}"，
+// 合法对象解析后重排（Go map 键排序即 canonical），防严格端 400 与缓存抖动。
+func canonicalArguments(s string) string {
+	return canon(parseObj(s))
+}
+
+// stripThinkingSignature 清理 messages 协议请求里的杂散 signature 字段与顶层
+// thinking 参数。多轮带回的 signature 上游不认会 400，透传前清理。
+// thinking 内容块本身保留（无签名的 thinking 是合法 anthropic 输入）。
+func stripThinkingSignature(in map[string]any) {
+	delete(in, "thinking")
+	for _, m := range asArr(in["messages"]) {
+		msg := asMap(m)
+		for _, b := range asArr(msg["content"]) {
+			if bm, ok := b.(map[string]any); ok {
+				delete(bm, "signature")
+			}
+		}
+	}
+}
+
+// maxDataURLBytes data: URL 长度阈值，超了钳制（P1b-8，用户定的 64KB）。
+const maxDataURLBytes = 64 * 1024
+
+// clampMediaURL data: URL 超阈值钳制，防 400/413/上下文爆炸。http(s) URL 不动。
+func clampMediaURL(u string) string {
+	if len(u) <= maxDataURLBytes || !strings.HasPrefix(u, "data:") {
+		return u
+	}
+	if i := strings.Index(u, ";base64,"); i > 0 {
+		return u[:i] + ";base64,[omitted " + itoa(len(u)-i-len(";base64,")) + " bytes]"
+	}
+	return u[:maxDataURLBytes] + "...[truncated]"
+}
+
+func itoa(n int) string {
+	if n == 0 {
+		return "0"
+	}
+	var b [20]byte
+	i := len(b)
+	for n > 0 {
+		i--
+		b[i] = byte('0' + n%10)
+		n /= 10
+	}
+	return string(b[i:])
+}
+
+// mediaPlaceholder 未知媒体类型（document/input_file/input_audio）转文本占位，
+// 不再静默丢，保证模态变化可感知。
+func mediaPlaceholder(kind string) map[string]any {
+	return map[string]any{"type": "text", "text": "[unsupported media omitted: " + kind + "]"}
+}
+
 // textOfContent 取 chat content（string 或 parts 数组）里的纯文本。
 func textOfContent(content any) string {
 	if s, ok := content.(string); ok {
@@ -193,7 +281,7 @@ func chatToResponsesReq(in map[string]any) map[string]any {
 						iu = map[string]any{"url": s}
 					}
 					if u := getStr(asMap(iu), "url"); u != "" {
-						parts = append(parts, map[string]any{"type": "input_image", "image_url": u})
+						parts = append(parts, map[string]any{"type": "input_image", "image_url": clampMediaURL(u)})
 					}
 				}
 			}
@@ -202,10 +290,7 @@ func chatToResponsesReq(in map[string]any) map[string]any {
 		for _, tc := range asArr(msg["tool_calls"]) {
 			tm := asMap(tc)
 			fn := asMap(tm["function"])
-			args := asStr(fn["arguments"])
-			if args == "" {
-				args = "{}"
-			}
+			args := canonicalArguments(asStr(fn["arguments"]))
 			input = append(input, map[string]any{
 				"type": "function_call", "call_id": getStr(tm, "id"),
 				"name": getStr(fn, "name"), "arguments": args,
@@ -270,10 +355,7 @@ func responsesToChatReq(in map[string]any) map[string]any {
 				if id == "" {
 					id = getStr(item, "id")
 				}
-				args := asStr(item["arguments"])
-				if args == "" {
-					args = "{}"
-				}
+				args := canonicalArguments(asStr(item["arguments"]))
 				messages = append(messages, map[string]any{
 					"role": "assistant", "content": nil,
 					"tool_calls": []any{map[string]any{
@@ -327,7 +409,7 @@ func responsesToChatReq(in map[string]any) map[string]any {
 							}
 						case "input_image":
 							if u := asStr(pm["image_url"]); u != "" {
-								parts = append(parts, map[string]any{"type": "image_url", "image_url": map[string]any{"url": u}})
+								parts = append(parts, map[string]any{"type": "image_url", "image_url": map[string]any{"url": clampMediaURL(u)}})
 							}
 						}
 					}
@@ -449,13 +531,19 @@ func messagesToChatReq(in map[string]any) map[string]any {
 						mt = "image/png"
 					}
 					parts = append(parts, map[string]any{"type": "image_url",
-						"image_url": map[string]any{"url": "data:" + mt + ";base64," + asStr(src["data"])}})
+						"image_url": map[string]any{"url": clampMediaURL("data:" + mt + ";base64," + asStr(src["data"]))}})
 				case "url":
 					if u := asStr(src["url"]); u != "" {
 						parts = append(parts, map[string]any{"type": "image_url",
-							"image_url": map[string]any{"url": u}})
+							"image_url": map[string]any{"url": clampMediaURL(u)}})
 					}
+				default:
+					// 未知 source 类型转占位，不静默丢。
+					parts = append(parts, mediaPlaceholder("image:"+asStr(src["type"])))
 				}
+			case "document", "input_file", "input_audio":
+				// 不支持的模态转占位，保证变化可感知。
+				parts = append(parts, mediaPlaceholder(asStr(bm["type"])))
 			case "tool_use":
 				input := bm["input"]
 				if input == nil {
@@ -612,7 +700,7 @@ func chatToMessagesReq(in map[string]any) map[string]any {
 						iu = map[string]any{"url": s}
 					}
 					if u := getStr(asMap(iu), "url"); u != "" {
-						blocks = append(blocks, map[string]any{"type": "image", "source": dataURLToImageSource(u)})
+						blocks = append(blocks, map[string]any{"type": "image", "source": dataURLToImageSource(clampMediaURL(u))})
 					}
 				}
 			}
@@ -766,7 +854,7 @@ func messagesToResponsesReq(in map[string]any) map[string]any {
 					u = "data:" + mt + ";base64," + asStr(src["data"])
 				}
 				if u != "" {
-					input = append(input, map[string]any{"type": "input_image", "image_url": u})
+					input = append(input, map[string]any{"type": "input_image", "image_url": clampMediaURL(u)})
 				}
 			case "tool_use":
 				flushPending()
@@ -792,6 +880,19 @@ func messagesToResponsesReq(in map[string]any) map[string]any {
 					"type":    "function_call_output",
 					"call_id": getStr(bm, "tool_use_id"), "output": output,
 				})
+			case "document", "input_file", "input_audio":
+				// 不支持的模态转占位，不静默丢。
+				typ := "input_text"
+				if role == "assistant" {
+					typ = "output_text"
+				}
+				if pendingRole != "" && pendingRole != role {
+					flushPending()
+				}
+				pendingRole = role
+				ph := mediaPlaceholder(asStr(bm["type"]))
+				ph["type"] = typ
+				pendingParts = append(pendingParts, ph)
 			case "thinking", "redacted_thinking":
 				// 原生 thinking 无签名一律丢弃（cc-switch 行为）。
 			}
@@ -912,10 +1013,14 @@ func responsesToMessagesReq(in map[string]any) map[string]any {
 							messages = append(messages, map[string]any{
 								"role": role,
 								"content": []any{map[string]any{
-									"type": "image", "source": dataURLToImageSource(u),
+									"type": "image", "source": dataURLToImageSource(clampMediaURL(u)),
 								}},
 							})
 						}
+					case "input_file":
+						// 不支持的模态转占位，不静默丢。
+						flushPending()
+						pushText(role, asStr(mediaPlaceholder("input_file")["text"]))
 					}
 				}
 			}

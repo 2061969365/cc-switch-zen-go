@@ -257,6 +257,10 @@ func convHandlerInner(w http.ResponseWriter, req *http.Request, inner string, ze
 		writeConvError(w, http.StatusBadRequest, "invalid json: "+err.Error())
 		return
 	}
+	// P1b-5：递归删除 "_" 开头私有字段，防上游 "Extra inputs" 400。
+	if f, ok := filterPrivateParams(in).(map[string]any); ok {
+		in = f
+	}
 	// P1b-10：请求级 reqID + 分段计时。流式只量到响应头（io.Copy 会阻塞到流结束）。
 	t0 := time.Now()
 	reqID := randHex(8)
@@ -312,6 +316,9 @@ func convHandlerInner(w http.ResponseWriter, req *http.Request, inner string, ze
 		// responses 同格式透传：客户端下一轮可能带回上轮网关现编的
 		// reasoning/function_call 条目（rs_/fc_ 前缀 ID），上游不认，先清洗。
 		upReq = sanitizeResponsesInput(in)
+	} else if inFmt == FmtMessages {
+		// P1b-7：messages 同格式透传：清理多轮带回的杂散 signature 与顶层 thinking。
+		stripThinkingSignature(in)
 	}
 	if stream && inFmt == FmtChat {
 		// chat 流式默认不带 usage，强制加上，终态转换需要它。
