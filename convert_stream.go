@@ -8,7 +8,7 @@
 package main
 
 import (
-	"bufio"
+	"bytes"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -35,8 +35,40 @@ func (s *sseSink) emit(v any) {
 	if err != nil {
 		return
 	}
-	_, _ = io.WriteString(s.w, "data: "+string(b)+"\n\n")
+	// P1a-1：Anthropic/Responses 客户端靠 event: 行分发，chat 协议无事件名。
+	// 从约定的 type 字段自动派生，调用方无需改动。
+	prefix := ""
+	if m, ok := v.(map[string]any); ok {
+		if t, ok := m["type"].(string); ok && isSSEvent(t) {
+			prefix = "event: " + t + "\n"
+		}
+	}
+	_, _ = io.WriteString(s.w, prefix+"data: "+string(b)+"\n\n")
 	s.f.Flush()
+}
+
+func isSSEvent(t string) bool {
+	return strings.HasPrefix(t, "message_") || strings.HasPrefix(t, "content_block_") ||
+		strings.HasPrefix(t, "response.") || t == "ping" || t == "error"
+}
+
+// emitAnthropicError / emitChatError / emitResponsesFailed：P1a-2 终态 error，
+// 发完后调用方必须置 finished 终态位，禁止再补成功尾。
+func (s *sseSink) emitAnthropicError(msg string) {
+	s.emit(map[string]any{"type": "error",
+		"error": map[string]any{"type": "api_error", "message": msg}})
+}
+
+func (s *sseSink) emitChatError(msg string) {
+	s.emit(map[string]any{"error": map[string]any{"message": msg, "type": "stream_error"}})
+	s.done()
+}
+
+func (s *sseSink) emitResponsesFailed(id, model, msg string) {
+	s.emit(map[string]any{"type": "response.failed",
+		"response": map[string]any{"id": id, "model": model, "status": "failed",
+			"error": map[string]any{"message": msg, "type": "upstream_error"}}})
+	s.done()
 }
 
 func (s *sseSink) done() {
@@ -48,30 +80,63 @@ func (s *sseSink) done() {
 	s.f.Flush()
 }
 
-// pumpSSE 逐行解析上游 SSE。chat/responses 只有 data 行；anthropic 有 event+data 对。
+// pumpSSE 按 SSE 帧（空行分隔）解析上游流。P1a-4：字节级累积切块，
+// 天然容忍 UTF-8 跨包与 \r\n；块内多 data: 行按规范 join("\n")；
+// 单块 16MB 上限防 OOM。chat/responses 只有 data 行；anthropic 有 event+data 对。
 // handler(event, data)：event 对 chat/responses 为 ""，anthropic 为事件名；data=="[DONE]" 表结束。
 func pumpSSE(r io.Reader, handler func(event, data string)) {
-	sc := bufio.NewScanner(r)
-	sc.Buffer(make([]byte, 64*1024), 16*1024*1024)
-	event := ""
-	for sc.Scan() {
-		line := sc.Text()
-		if strings.HasPrefix(line, ":") || line == "" {
-			continue
-		}
-		if strings.HasPrefix(line, "event:") {
-			event = strings.TrimSpace(strings.TrimPrefix(line, "event:"))
-			continue
-		}
-		if strings.HasPrefix(line, "data:") {
-			data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
-			handler(event, data)
-			event = ""
-			if data == "[DONE]" {
+	var buf []byte
+	tmp := make([]byte, 32*1024)
+	flush := func(final bool) {
+		for {
+			i := bytes.Index(buf, []byte("\n\n"))
+			if i < 0 {
+				if final && len(buf) > 0 {
+					parseSSEBlock(buf, handler)
+					buf = nil
+				}
 				return
 			}
+			parseSSEBlock(buf[:i], handler)
+			buf = buf[i+2:]
+		}
+		if len(buf) > 16*1024*1024 {
+			buf = nil // 等不到帧边界的超大块直接丢弃
 		}
 	}
+	for {
+		n, err := r.Read(tmp)
+		if n > 0 {
+			buf = append(buf, tmp[:n]...)
+			flush(false)
+		}
+		if err != nil {
+			flush(true)
+			return
+		}
+	}
+}
+
+func parseSSEBlock(block []byte, handler func(event, data string)) {
+	var event string
+	var datas []string
+	for _, line := range bytes.Split(block, []byte("\n")) {
+		line = bytes.TrimSuffix(line, []byte("\r"))
+		if len(line) == 0 || line[0] == ':' {
+			continue
+		}
+		if bytes.HasPrefix(line, []byte("event:")) {
+			event = string(bytes.TrimSpace(line[len("event:"):]))
+			continue
+		}
+		if bytes.HasPrefix(line, []byte("data:")) {
+			datas = append(datas, string(bytes.TrimSpace(line[len("data:"):])))
+		}
+	}
+	if len(datas) == 0 {
+		return
+	}
+	handler(event, strings.Join(datas, "\n"))
 }
 
 func parseSSEData(data string) map[string]any {
@@ -111,6 +176,8 @@ func streamChatToResponses(w http.ResponseWriter, r io.Reader, model string) {
 	order := []int{}
 	var usage map[string]any
 	finished := false
+	sawFinish := false // 是否见过上游终态（finish_reason 或 [DONE] 前的完成）
+	hasOutput := false // 是否有实质输出（文本/tool/usage）
 
 	flushCompleted := func(finish string) {
 		if finished {
@@ -144,6 +211,12 @@ func streamChatToResponses(w http.ResponseWriter, r io.Reader, model string) {
 
 	pumpSSE(r, func(_, data string) {
 		if data == "[DONE]" {
+			// P1a-2：裸 [DONE] 且无终态无输出 → failed。
+			if !sawFinish && !hasOutput && !finished {
+				finished = true
+				sink.emitResponsesFailed(respID, model, "upstream closed without terminal event")
+				return
+			}
 			flushCompleted("stop")
 			sink.done()
 			return
@@ -154,6 +227,7 @@ func streamChatToResponses(w http.ResponseWriter, r io.Reader, model string) {
 		}
 		if u, ok := chunk["usage"].(map[string]any); ok && len(u) > 0 {
 			usage = u
+			hasOutput = true
 		}
 		for _, c := range asArr(chunk["choices"]) {
 			cm := asMap(c)
@@ -167,6 +241,7 @@ func streamChatToResponses(w http.ResponseWriter, r io.Reader, model string) {
 					"response": map[string]any{"id": respID, "model": model}})
 			}
 			if t, ok := delta["content"].(string); ok && t != "" {
+				hasOutput = true
 				text.WriteString(t)
 				sink.emit(map[string]any{"type": "response.output_text.delta",
 					"item_id": "msg_0", "output_index": 0, "delta": t})
@@ -184,6 +259,7 @@ func streamChatToResponses(w http.ResponseWriter, r io.Reader, model string) {
 					tools[idx] = t
 					order = append(order, idx)
 				}
+				hasOutput = true
 				if id := getStr(tm, "id"); id != "" {
 					t.callID = id
 				}
@@ -209,6 +285,7 @@ func streamChatToResponses(w http.ResponseWriter, r io.Reader, model string) {
 				}
 			}
 			if fr, ok := cm["finish_reason"].(string); ok && fr != "" {
+				sawFinish = true
 				for _, idx := range order {
 					t := tools[idx]
 					if t.added {
@@ -227,6 +304,13 @@ func streamChatToResponses(w http.ResponseWriter, r io.Reader, model string) {
 		}
 	})
 	if !finished {
+		// P1a-2：EOF 无终态。见过 finish 按 stop 收尾；有实质输出按成功收尾；
+		// 零输出直接 failed，不伪造 completed。
+		if !sawFinish && !hasOutput {
+			finished = true
+			sink.emitResponsesFailed(respID, model, "upstream closed without terminal event")
+			return
+		}
 		flushCompleted("stop")
 		sink.done()
 	}
@@ -249,16 +333,26 @@ func streamResponsesToChat(w http.ResponseWriter, r io.Reader, model string) {
 	nextIdx := 0
 	var usage map[string]any
 	finished := false
+	sawTerminal := false // 是否见过 completed/incomplete/failed
+	incomplete := false  // 上游是否为 response.incomplete（截断）
+	failed := false      // 上游是否为 response.failed
+	hasOutput := false   // 是否有实质输出
 
 	finish := func() {
 		if finished {
 			return
 		}
 		finished = true
-		fr := "stop"
-		if len(tools) > 0 {
-			fr = "tool_calls"
+		if failed {
+			sink.emitChatError("upstream response.failed")
+			return
 		}
+		// P1a-3：截断走 length，不再一律 stop（finishFromResponsesStatus）。
+		status := "completed"
+		if incomplete {
+			status = "incomplete"
+		}
+		fr := finishFromResponsesStatus(status, len(tools) > 0)
 		last := chatChunk(chatID, model, map[string]any{}, fr)
 		if len(usage) > 0 {
 			last["usage"] = chatUsageFromResponses(usage)
@@ -269,6 +363,10 @@ func streamResponsesToChat(w http.ResponseWriter, r io.Reader, model string) {
 
 	pumpSSE(r, func(_, data string) {
 		if data == "[DONE]" {
+			// P1a-2：裸 [DONE] 且无终态无输出 → error。
+			if !sawTerminal && !hasOutput {
+				failed = true
+			}
 			finish()
 			return
 		}
@@ -285,10 +383,12 @@ func streamResponsesToChat(w http.ResponseWriter, r io.Reader, model string) {
 			sink.emit(chatChunk(chatID, model, map[string]any{"role": "assistant"}, ""))
 		case "response.output_text.delta":
 			if d := asStr(ev["delta"]); d != "" {
+				hasOutput = true
 				sink.emit(chatChunk(chatID, model, map[string]any{"content": d}, ""))
 			}
 		case "response.reasoning_summary_text.delta", "response.reasoning_text.delta":
 			if d := asStr(ev["delta"]); d != "" {
+				hasOutput = true
 				sink.emit(chatChunk(chatID, model, map[string]any{"reasoning_content": d}, ""))
 			}
 		case "response.output_item.added":
@@ -314,6 +414,7 @@ func streamResponsesToChat(w http.ResponseWriter, r io.Reader, model string) {
 				nextIdx++
 				tools[id] = t
 			}
+			hasOutput = true
 			d := asStr(ev["delta"])
 			t.args.WriteString(d)
 			delta := map[string]any{"tool_calls": []any{map[string]any{
@@ -335,11 +436,20 @@ func streamResponsesToChat(w http.ResponseWriter, r io.Reader, model string) {
 			if u, ok := resp["usage"].(map[string]any); ok {
 				usage = u
 			}
+			sawTerminal = true
+			incomplete = asStr(ev["type"]) == "response.incomplete"
 			finish()
 		case "response.failed":
+			// P1a-2：上游失败转 error 事件，禁止补成功尾。
+			sawTerminal = true
+			failed = true
 			finish()
 		}
 	})
+	// P1a-2：EOF 无终态。零输出直接 error；有输出按已见状态收尾。
+	if !sawTerminal && !hasOutput {
+		failed = true
+	}
 	finish()
 }
 
@@ -363,6 +473,8 @@ func streamChatToMessages(w http.ResponseWriter, r io.Reader, model string) {
 	var usage map[string]any
 	var stop string
 	finished := false
+	sawFinish := false // 是否见过上游 finish_reason
+	hasOutput := false // 是否有实质输出
 
 	ensureStart := func() {
 		if started {
@@ -385,6 +497,12 @@ func streamChatToMessages(w http.ResponseWriter, r io.Reader, model string) {
 			return
 		}
 		finished = true
+		// P1a-2：EOF 无终态且零输出 → error，不伪造 end_turn。
+		if !sawFinish && !hasOutput {
+			sink.emitAnthropicError("upstream closed without terminal event")
+			sink.emit(map[string]any{"type": "message_stop"})
+			return
+		}
 		ensureStart()
 		closeText()
 		for _, idx := range sortedKeys(tools) {
@@ -426,9 +544,11 @@ func streamChatToMessages(w http.ResponseWriter, r io.Reader, model string) {
 			cm := asMap(c)
 			delta := asMap(cm["delta"])
 			if fr, ok := cm["finish_reason"].(string); ok && fr != "" {
+				sawFinish = true
 				stop = anthropicStopFromFinish(fr, len(tools) > 0)
 			}
 			if t, ok := delta["content"].(string); ok && t != "" {
+				hasOutput = true
 				ensureStart()
 				if !textOpen {
 					textOpen = true
@@ -439,6 +559,7 @@ func streamChatToMessages(w http.ResponseWriter, r io.Reader, model string) {
 					"delta": map[string]any{"type": "text_delta", "text": t}})
 			}
 			for _, tc := range asArr(delta["tool_calls"]) {
+				hasOutput = true
 				ensureStart()
 				tm := asMap(tc)
 				idx := int(toFloat(tm["index"]))
@@ -492,12 +613,18 @@ func streamMessagesToChat(w http.ResponseWriter, r io.Reader, model string) {
 	var usage map[string]any
 	var finish string
 	finished := false
+	hasOutput := false // 是否有实质输出
 
 	finalize := func() {
 		if finished {
 			return
 		}
 		finished = true
+		// P1a-2：EOF 无终态且零输出 → error，不伪造 stop。
+		if finish == "" && !hasOutput {
+			sink.emitChatError("upstream closed without terminal event")
+			return
+		}
 		last := chatChunk(chatID, model, map[string]any{}, finishFromAnthropicStop(finish, len(toolIdx) > 0))
 		if len(usage) > 0 {
 			last["usage"] = chatUsageFromAnthropic(usage)
@@ -527,6 +654,7 @@ func streamMessagesToChat(w http.ResponseWriter, r io.Reader, model string) {
 			kind := asStr(cb["type"])
 			kindByIdx[idx] = kind
 			if kind == "tool_use" {
+				hasOutput = true
 				toolIdx[idx] = nextTool
 				nextTool++
 				toolID[idx] = getStr(cb, "id")
@@ -540,10 +668,12 @@ func streamMessagesToChat(w http.ResponseWriter, r io.Reader, model string) {
 			switch asStr(d["type"]) {
 			case "text_delta":
 				if t := asStr(d["text"]); t != "" {
+					hasOutput = true
 					sink.emit(chatChunk(chatID, model, map[string]any{"content": t}, ""))
 				}
 			case "input_json_delta":
 				if p := asStr(d["partial_json"]); p != "" {
+					hasOutput = true
 					sink.emit(chatChunk(chatID, model, map[string]any{"tool_calls": []any{map[string]any{
 						"index": toolIdx[idx], "function": map[string]any{"arguments": p},
 					}}}, ""))
@@ -583,6 +713,9 @@ func streamResponsesToMessages(w http.ResponseWriter, r io.Reader, model string)
 	var stop string
 	hasTool := false
 	finished := false
+	sawTerminal := false // 是否见过 completed/incomplete/failed
+	incomplete := false  // 是否为 response.incomplete（截断）
+	hasOutput := false   // 是否有实质输出
 
 	ensureStart := func() {
 		if started {
@@ -613,6 +746,12 @@ func streamResponsesToMessages(w http.ResponseWriter, r io.Reader, model string)
 			return
 		}
 		finished = true
+		// P1a-2：EOF 无终态且零输出 → error，不伪造 end_turn。
+		if !sawTerminal && !hasOutput {
+			sink.emitAnthropicError("upstream closed without terminal event")
+			sink.emit(map[string]any{"type": "message_stop"})
+			return
+		}
 		ensureStart()
 		closeText()
 		for id, idx := range toolIdxByItem {
@@ -621,9 +760,13 @@ func streamResponsesToMessages(w http.ResponseWriter, r io.Reader, model string)
 			}
 		}
 		if stop == "" {
-			if hasTool {
+			// P1a-3：截断走 max_tokens（cc-switch map_responses_stop_reason）。
+			switch {
+			case hasTool:
 				stop = "tool_use"
-			} else {
+			case incomplete:
+				stop = "max_tokens"
+			default:
 				stop = "end_turn"
 			}
 		}
@@ -653,6 +796,7 @@ func streamResponsesToMessages(w http.ResponseWriter, r io.Reader, model string)
 			ensureStart()
 		case "response.output_text.delta", "response.refusal.delta":
 			if d := asStr(ev["delta"]); d != "" {
+				hasOutput = true
 				openText()
 				sink.emit(map[string]any{"type": "content_block_delta", "index": textIdx,
 					"delta": map[string]any{"type": "text_delta", "text": d}})
@@ -692,6 +836,7 @@ func streamResponsesToMessages(w http.ResponseWriter, r io.Reader, model string)
 		case "response.function_call_arguments.delta":
 			if idx, ok := toolIdxByItem[getStr(ev, "item_id")]; ok {
 				if d := asStr(ev["delta"]); d != "" {
+					hasOutput = true
 					sink.emit(map[string]any{"type": "content_block_delta", "index": idx,
 						"delta": map[string]any{"type": "input_json_delta", "partial_json": d}})
 				}
@@ -702,6 +847,7 @@ func streamResponsesToMessages(w http.ResponseWriter, r io.Reader, model string)
 					continue
 				}
 				if d := asStr(ev["delta"]); d != "" {
+					hasOutput = true
 					sink.emit(map[string]any{"type": "content_block_delta", "index": idx,
 						"delta": map[string]any{"type": "thinking_delta", "thinking": d}})
 				}
@@ -714,10 +860,16 @@ func streamResponsesToMessages(w http.ResponseWriter, r io.Reader, model string)
 			if u, ok := resp["usage"].(map[string]any); ok {
 				usage = u
 			}
+			sawTerminal = true
+			incomplete = asStr(ev["type"]) == "response.incomplete"
 			finalize()
 		case "response.failed":
-			stop = "end_turn"
-			finalize()
+			// P1a-2：上游失败转 error 事件，禁止补成功尾。
+			sawTerminal = true
+			finished = true
+			ensureStart()
+			sink.emitAnthropicError("upstream response.failed")
+			sink.emit(map[string]any{"type": "message_stop"})
 		}
 	})
 	finalize()
@@ -736,14 +888,28 @@ func streamMessagesToResponses(w http.ResponseWriter, r io.Reader, model string)
 	toolItemID := ""
 	var usage map[string]any
 	finished := false
+	sawStop := false    // 是否见过 message_stop（正常终态）
+	anthropicStop := "" // message_delta 带来的 stop_reason
+	hasTool := false    // 是否开过 tool_use 块
+	hasOutput := false  // 是否有实质输出
 
 	finalize := func() {
 		if finished {
 			return
 		}
 		finished = true
-		ev := map[string]any{"type": "response.completed",
-			"response": map[string]any{"id": respID, "status": "completed"}}
+		// P1a-2：EOF 无终态且零输出 → failed，不伪造 completed。
+		if !sawStop && !hasOutput {
+			sink.emitResponsesFailed(respID, model, "upstream closed without terminal event")
+			return
+		}
+		// P1a-3：max_tokens 走 incomplete（responsesStatusFromFinish）。
+		status, detail := responsesStatusFromFinish(finishFromAnthropicStop(anthropicStop, hasTool))
+		ev := map[string]any{"type": "response." + status,
+			"response": map[string]any{"id": respID, "status": status}}
+		if detail != nil {
+			ev["response"].(map[string]any)["incomplete_details"] = detail
+		}
 		if len(usage) > 0 {
 			ev["response"].(map[string]any)["usage"] = responsesUsageFromAnthropic(usage)
 		}
@@ -780,6 +946,7 @@ func streamMessagesToResponses(w http.ResponseWriter, r io.Reader, model string)
 			kindByIdx[idx] = kind
 			switch kind {
 			case "text":
+				hasOutput = true
 				sink.emit(map[string]any{"type": "response.output_item.added",
 					"output_index": outIdx, "item": map[string]any{
 						"type": "message", "id": newID("msg_"), "status": "in_progress",
@@ -788,6 +955,8 @@ func streamMessagesToResponses(w http.ResponseWriter, r io.Reader, model string)
 					"item_id": "msg_0", "output_index": outIdx,
 					"part": map[string]any{"type": "output_text", "text": ""}})
 			case "tool_use":
+				hasTool = true
+				hasOutput = true
 				callID := getStr(cb, "id")
 				toolCallID[idx] = callID
 				toolItemID = "fc_" + callID
@@ -797,6 +966,7 @@ func streamMessagesToResponses(w http.ResponseWriter, r io.Reader, model string)
 						"type": "function_call", "id": toolItemID, "call_id": callID,
 						"name": getStr(cb, "name"), "arguments": ""}})
 			case "thinking", "redacted_thinking":
+				hasOutput = true
 				sink.emit(map[string]any{"type": "response.output_item.added",
 					"output_index": outIdx, "item": map[string]any{
 						"type": "reasoning", "id": newID("rs_")}})
@@ -841,10 +1011,15 @@ func streamMessagesToResponses(w http.ResponseWriter, r io.Reader, model string)
 				outIdx++
 			}
 		case "message_delta":
+			d := asMap(ev["delta"])
+			if s := asStr(d["stop_reason"]); s != "" {
+				anthropicStop = s
+			}
 			if u, ok := ev["usage"].(map[string]any); ok {
 				usage = u
 			}
 		case "message_stop":
+			sawStop = true
 			finalize()
 		}
 	})
