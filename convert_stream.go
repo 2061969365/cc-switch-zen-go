@@ -94,14 +94,13 @@ func pumpSSE(r io.Reader, handler func(event, data string)) {
 				if final && len(buf) > 0 {
 					parseSSEBlock(buf, handler)
 					buf = nil
+				} else if len(buf) > 16*1024*1024 {
+					buf = nil // 等不到帧边界的超大块直接丢弃
 				}
 				return
 			}
 			parseSSEBlock(buf[:i], handler)
 			buf = buf[i+2:]
-		}
-		if len(buf) > 16*1024*1024 {
-			buf = nil // 等不到帧边界的超大块直接丢弃
 		}
 	}
 	for {
