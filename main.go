@@ -331,6 +331,15 @@ func convHandlerInner(w http.ResponseWriter, req *http.Request, inner string, ze
 		// chat 流式默认不带 usage，强制加上，终态转换需要它。
 		upReq["stream_options"] = map[string]any{"include_usage": true}
 	}
+	// 调试：spark 1.3 的 400 只在网关链路出现，打印实际发上游的 body 前 2KB
+	if strings.Contains(model, "muse-spark") {
+		if b, _ := json.Marshal(upReq); len(b) > 0 {
+			if len(b) > 2048 {
+				b = b[:2048]
+			}
+			log.Printf("[REQ %s] spark upReq: %.2048s", reqID, string(b))
+		}
+	}
 	tConv1 = time.Now()
 	upBody, err := json.Marshal(upReq)
 	if err != nil {
@@ -353,6 +362,7 @@ func convHandlerInner(w http.ResponseWriter, req *http.Request, inner string, ze
 	}
 	resp, err := upstreamClient.Do(fwd)
 	if err != nil {
+		log.Printf("[REQ %s] Do err: %v", reqID, err)
 		writeConvError(w, http.StatusBadGateway, "upstream unreachable")
 		return
 	}
@@ -361,7 +371,15 @@ func convHandlerInner(w http.ResponseWriter, req *http.Request, inner string, ze
 	upStatus = resp.StatusCode
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		// P1b-9：按客户端协议包规范 error envelope，不再原样透传。
-		writeUpstreamError(w, inFmt, resp.StatusCode, resp.Body)
+		// 同时把上游原文打到网关日志，定位校验失败原因（spark 1.3 400 专用）。
+		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 8<<10))
+		if len(raw) > 0 {
+			log.Printf("[REQ %s] upstream %d body: %.800s", reqID, resp.StatusCode, strings.TrimSpace(string(raw)))
+		} else {
+			log.Printf("[REQ %s] upstream %d body: <empty>", reqID, resp.StatusCode)
+		}
+		// 已消费 body，重包一个 Reader 给 writeUpstreamError 复用
+		writeUpstreamError(w, inFmt, resp.StatusCode, bytes.NewReader(raw))
 		return
 	}
 	if stream {
