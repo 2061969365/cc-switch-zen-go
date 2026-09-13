@@ -1118,9 +1118,11 @@ func ensureMessagesDefaults(upReq map[string]any) {
 // （rs_/fc_ 前缀），客户端多轮/工具调用时原样带回 input，上游不认这些 ID，
 // 会报 "Referenced reasoning item ... was not found or has expired"。
 //
-// 规则：
-//   - reasoning：无 encrypted_content 的丢弃（含网关 summary_text 退化项）；
-//     有 encrypted_content 的保留（上游可验签继续用）。
+// 规则（v0.3.1 全丢）：
+//   - reasoning：全部丢弃。encrypted_content 系签发方绑定，不透明且跨
+//     key/跨网关/跨期即失效（上游报 "was not issued to this caller"），
+//     而客户端会话会全量回放历史 reasoning，一条过期即整轮 400 且不可
+//     自愈；仅损失跨轮 thinking 连续性。
 //   - function_call：id 为网关编的 fc_<call_id> 形式时还原 id=call_id；其他保留。
 //   - 字符串 input / 无 input：原样返回。
 func sanitizeResponsesInput(in map[string]any) map[string]any {
@@ -1136,10 +1138,8 @@ func sanitizeResponsesInput(in map[string]any) map[string]any {
 		item := asMap(it)
 		switch asStr(item["type"]) {
 		case "reasoning":
-			if asStr(item["encrypted_content"]) == "" {
-				continue
-			}
-			kept = append(kept, it)
+			// v0.3.1 全丢：不再信任任何回传的 reasoning（含带 encrypted_content 的）。
+			continue
 		case "function_call":
 			id := getStr(item, "id")
 			callID := getStr(item, "call_id")

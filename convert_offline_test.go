@@ -203,17 +203,15 @@ func TestSanitizeResponsesInput(t *testing.T) {
 		{"type":"function_call_output","call_id":"call_1","output":"ok"}]}`)
 	out := sanitizeResponsesInput(in)
 	items := asArr(out["input"])
-	// 丢 1 条无签名 reasoning，应剩 5 条。
-	if len(items) != 5 {
-		t.Fatalf("应剩 5 条，得 %d: %s", len(items), canon(items))
+	// v0.3.1 全丢：2 条 reasoning 全丢（含带 encrypted_content 的），应剩 4 条。
+	if len(items) != 4 {
+		t.Fatalf("应剩 4 条，得 %d: %s", len(items), canon(items))
 	}
 	bashOK := false
 	for _, it := range items {
 		m := asMap(it)
 		if asStr(m["type"]) == "reasoning" {
-			if getStr(m, "id") != "rs_real" {
-				t.Errorf("无签名 reasoning 应丢弃: %s", canon(m))
-			}
+			t.Errorf("reasoning 应全丢弃: %s", canon(m))
 		}
 		if asStr(m["type"]) == "function_call" && getStr(m, "name") == "bash" {
 			bashOK = true
