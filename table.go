@@ -8,7 +8,6 @@ package main
 
 import (
 	"io"
-	"log"
 	"net/http"
 	"os"
 	"regexp"
@@ -170,17 +169,17 @@ func refreshTableFromOfficial() {
 	client := &http.Client{Timeout: 15 * time.Second}
 	resp, err := client.Get(url)
 	if err != nil {
-		log.Printf("映射表刷新失败（用内置快照）: %v", err)
+		logf("映射表刷新失败（用内置快照）: %v", err)
 		return
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != 200 {
-		log.Printf("映射表刷新 HTTP %d（用内置快照）", resp.StatusCode)
+		logf("映射表刷新 HTTP %d（用内置快照）", resp.StatusCode)
 		return
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
-		log.Printf("映射表读取失败（用内置快照）: %v", err)
+		logf("映射表读取失败（用内置快照）: %v", err)
 		return
 	}
 	n := 0
@@ -197,5 +196,5 @@ func refreshTableFromOfficial() {
 	}
 	total := len(modelTable)
 	tableMu.Unlock()
-	log.Printf("映射表刷新：官网解析 %d 个模型，当前共 %d 个", n, total)
+	logf("映射表刷新：官网解析 %d 个模型，当前共 %d 个", n, total)
 }

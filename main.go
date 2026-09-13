@@ -26,6 +26,7 @@
 //	OPENCODE_ZEN_BASE     上游，默认 https://opencode.ai/zen/v1
 //	OPENCODE_ZEN_API_KEY  默认 public（匿名免费层；有真 key 可覆盖）
 //	OPENCODE_ZEN_PROJECT  默认 default
+//	ZEN_DEBUG             设为 1 时打印逐请求调试日志（默认关闭，避免刷屏）
 package main
 
 import (
@@ -64,6 +65,12 @@ func env(key, def string) string {
 		return v
 	}
 	return def
+}
+
+// debugOn 是否输出逐请求调试日志（默认关）。开着刷屏会拖慢 Windows 控制台。
+func debugOn() bool {
+	v := os.Getenv("ZEN_DEBUG")
+	return v == "1" || strings.EqualFold(v, "true")
 }
 
 // newID 生成带前缀的随机 ID（resp_/msg_/chatcmpl_ 等响应包络用）。
@@ -128,13 +135,13 @@ func main() {
 			setZenHeaders(req.Header, apiKey, project)
 		},
 		ErrorHandler: func(w http.ResponseWriter, req *http.Request, err error) {
-			log.Printf("上游错误 %s %s: %v", req.Method, req.URL.Path, err)
+			logf("上游错误 %s %s: %v", req.Method, req.URL.Path, err)
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusBadGateway)
 			_, _ = w.Write([]byte(`{"error":"upstream unreachable"}`))
 		},
 		ModifyResponse: func(resp *http.Response) error {
-			log.Printf("%s %s -> 上游 %d", resp.Request.Method, resp.Request.URL.Path, resp.StatusCode)
+			logf("%s %s -> 上游 %d", resp.Request.Method, resp.Request.URL.Path, resp.StatusCode)
 			return nil
 		},
 	}
@@ -171,7 +178,7 @@ func main() {
 	})
 
 	addr := ":" + env("PORT", "8080")
-	log.Printf("zen-go headless 监听 %s，上游 %s", addr, zenBase.String())
+	logf("zen-go headless 监听 %s，上游 %s", addr, zenBase.String())
 	seedBuiltinTable()
 	go refreshTableFromOfficial()
 	// P0-3：全入口请求体上限 200MB（/conv 内部另有更严的 32MB）。
@@ -276,7 +283,7 @@ func convHandlerInner(w http.ResponseWriter, req *http.Request, inner string, ze
 			}
 			return t.Sub(t0).Milliseconds()
 		}
-		log.Printf("[REQ %s] %s model=%s stream=%v in=%s out=%s up=%d read=%dms conv1=%dms up=%dms dec=%dms conv2=%dms total=%dms",
+		logf("[REQ %s] %s model=%s stream=%v in=%s out=%s up=%d read=%dms conv1=%dms up=%dms dec=%dms conv2=%dms total=%dms",
 			reqID, inner, model, stream, inFmt, target, upStatus,
 			ms(tRead), ms(tConv1), ms(tUp), ms(tDec), ms(tConv2), time.Since(t0).Milliseconds())
 	}()
@@ -331,13 +338,14 @@ func convHandlerInner(w http.ResponseWriter, req *http.Request, inner string, ze
 		// chat 流式默认不带 usage，强制加上，终态转换需要它。
 		upReq["stream_options"] = map[string]any{"include_usage": true}
 	}
-	// 调试：spark 1.3 的 400 只在网关链路出现，打印实际发上游的 body 前 2KB
-	if strings.Contains(model, "muse-spark") {
+	// ZEN_DEBUG=1 时打印实际发上游的 body 前 2KB（默认关闭：量大刷屏，
+	// Windows 控制台回压会拖慢请求）。
+	if debugOn() && strings.Contains(model, "muse-spark") {
 		if b, _ := json.Marshal(upReq); len(b) > 0 {
 			if len(b) > 2048 {
 				b = b[:2048]
 			}
-			log.Printf("[REQ %s] spark upReq: %.2048s", reqID, string(b))
+			logf("[REQ %s] spark upReq: %.2048s", reqID, string(b))
 		}
 	}
 	tConv1 = time.Now()
@@ -362,7 +370,7 @@ func convHandlerInner(w http.ResponseWriter, req *http.Request, inner string, ze
 	}
 	resp, err := upstreamClient.Do(fwd)
 	if err != nil {
-		log.Printf("[REQ %s] Do err: %v", reqID, err)
+		logf("[REQ %s] Do err: %v", reqID, err)
 		writeConvError(w, http.StatusBadGateway, "upstream unreachable")
 		return
 	}
@@ -374,9 +382,9 @@ func convHandlerInner(w http.ResponseWriter, req *http.Request, inner string, ze
 		// 同时把上游原文打到网关日志，定位校验失败原因（spark 1.3 400 专用）。
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 8<<10))
 		if len(raw) > 0 {
-			log.Printf("[REQ %s] upstream %d body: %.800s", reqID, resp.StatusCode, strings.TrimSpace(string(raw)))
+			logf("[REQ %s] upstream %d body: %.800s", reqID, resp.StatusCode, strings.TrimSpace(string(raw)))
 		} else {
-			log.Printf("[REQ %s] upstream %d body: <empty>", reqID, resp.StatusCode)
+			logf("[REQ %s] upstream %d body: <empty>", reqID, resp.StatusCode)
 		}
 		// 已消费 body，重包一个 Reader 给 writeUpstreamError 复用
 		writeUpstreamError(w, inFmt, resp.StatusCode, bytes.NewReader(raw))
