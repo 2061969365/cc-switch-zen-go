@@ -83,3 +83,31 @@ func TestPassthroughLearnSSE(t *testing.T) {
 	}
 	evictIssued("rs_stream_native")
 }
+
+func TestCrossFormatNoLeak(t *testing.T) {
+	// responses->chat：reasoning 只取 summary 文本转 reasoning_content，不带加密串。
+	chatReq := responsesToChatReq(mustJSON(t, `{"model":"m","input":[
+		{"type":"reasoning","id":"rs_x","encrypted_content":"encX",
+		 "summary":[{"type":"summary_text","text":"想了一下"}]}]}`))
+	if strings.Contains(canon(chatReq), "encX") || strings.Contains(canon(chatReq), "encrypted_content") {
+		t.Fatalf("跨格式 chat 不应泄漏加密串: %s", canon(chatReq))
+	}
+	// responses->messages：reasoning 直接丢弃。
+	msgReq := responsesToMessagesReq(mustJSON(t, `{"model":"m","input":[
+		{"type":"reasoning","id":"rs_x","encrypted_content":"encX","summary":[]}]}`))
+	if strings.Contains(canon(msgReq), "encX") {
+		t.Fatalf("跨格式 messages 不应泄漏加密串: %s", canon(msgReq))
+	}
+	// 逆转换造的无 id reasoning：带回时必丢（isIssued("")=false）。
+	out := sanitizeResponsesInput(mustJSON(t, `{"model":"m","input":[
+		{"type":"reasoning","summary":[{"type":"summary_text","text":"t"}]}]}`))
+	if len(asArr(out["input"])) != 0 {
+		t.Fatalf("无 id reasoning 应丢弃: %s", canon(out["input"]))
+	}
+	// Tracked 版同样上报空放行。
+	_, allowed := sanitizeResponsesInputTracked(mustJSON(t, `{"model":"m","input":[
+		{"type":"reasoning","id":"rs_unknown","encrypted_content":"e","summary":[]}]}`))
+	if len(allowed) != 0 {
+		t.Fatalf("异源放行应为空: %v", allowed)
+	}
+}
