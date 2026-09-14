@@ -1118,27 +1118,37 @@ func ensureMessagesDefaults(upReq map[string]any) {
 // （rs_/fc_ 前缀），客户端多轮/工具调用时原样带回 input，上游不认这些 ID，
 // 会报 "Referenced reasoning item ... was not found or has expired"。
 //
-// 规则（v0.3.1 全丢）：
-//   - reasoning：全部丢弃。encrypted_content 系签发方绑定，不透明且跨
-//     key/跨网关/跨期即失效（上游报 "was not issued to this caller"），
-//     而客户端会话会全量回放历史 reasoning，一条过期即整轮 400 且不可
-//     自愈；仅损失跨轮 thinking 连续性。
+// 规则（Plan A 最小验证：签发集合放行）：
+//   - reasoning：id 在本进程签发集合内（含带 encrypted_content 的）则放行，
+//     保留热缓存；网关没见过的 id（含无 id 的）视为异 caller 旧毒，丢弃。
 //   - function_call：id 为网关编的 fc_<call_id> 形式时还原 id=call_id；其他保留。
 //   - 字符串 input / 无 input：原样返回。
 func sanitizeResponsesInput(in map[string]any) map[string]any {
+	out, _ := sanitizeResponsesInputTracked(in)
+	return out
+}
+
+// sanitizeResponsesInputTracked 同 sanitizeResponsesInput，额外返回本轮放行的
+// reasoning id（400 反馈淘汰用）。
+func sanitizeResponsesInputTracked(in map[string]any) (map[string]any, []string) {
 	raw, ok := in["input"]
 	if !ok || raw == nil {
-		return in
+		return in, nil
 	}
 	if _, ok := raw.(string); ok {
-		return in
+		return in, nil
 	}
 	var kept []any
+	var allowed []string
 	for _, it := range asArr(raw) {
 		item := asMap(it)
 		switch asStr(item["type"]) {
 		case "reasoning":
-			// v0.3.1 全丢：不再信任任何回传的 reasoning（含带 encrypted_content 的）。
+			// Plan A：只放行本进程经手过的 id，其余视为异 caller 旧毒丢弃。
+			if id := getStr(item, "id"); isIssued(id) {
+				kept = append(kept, it)
+				allowed = append(allowed, id)
+			}
 			continue
 		case "function_call":
 			id := getStr(item, "id")
@@ -1165,5 +1175,5 @@ func sanitizeResponsesInput(in map[string]any) map[string]any {
 		kept = []any{}
 	}
 	out["input"] = kept
-	return out
+	return out, allowed
 }

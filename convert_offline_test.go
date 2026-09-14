@@ -203,7 +203,7 @@ func TestSanitizeResponsesInput(t *testing.T) {
 		{"type":"function_call_output","call_id":"call_1","output":"ok"}]}`)
 	out := sanitizeResponsesInput(in)
 	items := asArr(out["input"])
-	// v0.3.1 全丢：2 条 reasoning 全丢（含带 encrypted_content 的），应剩 4 条。
+	// Plan A：未知 id 全丢（含带 encrypted_content 的），应剩 4 条。
 	if len(items) != 4 {
 		t.Fatalf("应剩 4 条，得 %d: %s", len(items), canon(items))
 	}
@@ -211,7 +211,7 @@ func TestSanitizeResponsesInput(t *testing.T) {
 	for _, it := range items {
 		m := asMap(it)
 		if asStr(m["type"]) == "reasoning" {
-			t.Errorf("reasoning 应全丢弃: %s", canon(m))
+			t.Errorf("未知 id reasoning 应丢弃: %s", canon(m))
 		}
 		if asStr(m["type"]) == "function_call" && getStr(m, "name") == "bash" {
 			bashOK = true
