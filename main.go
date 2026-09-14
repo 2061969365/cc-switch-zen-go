@@ -44,7 +44,7 @@ import (
 	"time"
 )
 
-const zenUA = "opencode/1.18.18"
+const zenUA = "opencode/1.18.30"
 
 // P0-1：上游共享连接池+超时。http.DefaultClient 无限等，上游 hang 住会拖死网关。
 // zenClient 用于非流式（总超时 600s）；zenStreamClient 用于 SSE/透传（长连接，无总超时）。
@@ -75,6 +75,20 @@ func debugOn() bool {
 
 // newID 生成带前缀的随机 ID（resp_/msg_/chatcmpl_ 等响应包络用）。
 func newID(prefix string) string { return prefix + randHex(12) }
+
+// inheritClientHeaders 把入站客户端头透传到上游请求（最小验证用）。
+// conv 路径用 http.NewRequest 新建 fwd，原 setZenHeaders 的 setDefault
+// “客户端自带则保留”永不生效——此处先拷贝，setZenHeaders 再补缺。
+func inheritClientHeaders(dst, src http.Header) {
+	for _, k := range []string{"X-Opencode-Client", "X-Opencode-Session", "X-Opencode-Request", "X-Opencode-Project"} {
+		if v := src.Get(k); v != "" {
+			dst.Set(k, v)
+		}
+	}
+	if ua := src.Get("User-Agent"); ua != "" {
+		dst.Set("User-Agent", ua)
+	}
+}
 
 // setZenHeaders 注入上游匿名鉴权头：Bearer + x-opencode 四件套 + UA。
 // 缺了这组头上游报 MissingSessionID（已实测）。
@@ -364,6 +378,8 @@ func convHandlerInner(w http.ResponseWriter, req *http.Request, inner string, ze
 		return
 	}
 	setZenHeaders(fwd.Header, apiKey, project)
+	// 最小验证：先透传客户端头，再补缺（setZenHeaders 内 setDefault 只补空位）。
+	inheritClientHeaders(fwd.Header, req.Header)
 	fwd.Header.Set("Content-Type", "application/json")
 	// P0-1：流式用无总超时的 client，非流式用 600s 总超时。
 	upstreamClient := zenClient
