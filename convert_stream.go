@@ -151,6 +151,33 @@ func parseSSEBlock(block []byte, handler func(event, data string)) {
 	handler(event, strings.Join(datas, "\n"))
 }
 
+// passthroughLearnSSE 原样透传上游 SSE，并在 response.output_item.done 里
+// 嗅探原生 reasoning item id（Plan A 流式学习）。
+//
+// 只学上游原生 id：网关现编 id（rs_ 现编只出现在网关→客户端方向的转换
+// 输出里，此处是上游→网关方向，不存在现编污染）。
+func passthroughLearnSSE(w io.Writer, r io.Reader) {
+	fl, _ := w.(http.Flusher)
+	pumpSSE(r, func(_, data string) {
+		ev := parseSSEData(data)
+		if ev != nil && asStr(ev["type"]) == "response.output_item.done" {
+			if item := asMap(ev["item"]); asStr(item["type"]) == "reasoning" {
+				if id := getStr(item, "id"); id != "" {
+					learnReasoningID(id)
+				}
+			}
+		}
+		_, _ = io.WriteString(w, "data: "+data+"\n\n")
+		if fl != nil {
+			fl.Flush()
+		}
+	})
+	_, _ = io.WriteString(w, "data: [DONE]\n\n")
+	if fl != nil {
+		fl.Flush()
+	}
+}
+
 func parseSSEData(data string) map[string]any {
 	var v map[string]any
 	if err := json.Unmarshal([]byte(data), &v); err != nil {

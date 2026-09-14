@@ -276,6 +276,7 @@ func convHandlerInner(w http.ResponseWriter, req *http.Request, inner string, ze
 	var target Format
 	var tRead, tConv1, tUp, tDec, tConv2 time.Time
 	var upStatus int
+	var allowedReasoningIDs []string
 	defer func() {
 		ms := func(t time.Time) int64 {
 			if t.IsZero() {
@@ -326,7 +327,8 @@ func convHandlerInner(w http.ResponseWriter, req *http.Request, inner string, ze
 	} else if inFmt == FmtResponses {
 		// responses 同格式透传：客户端下一轮可能带回上轮网关现编的
 		// reasoning/function_call 条目（rs_/fc_ 前缀 ID），上游不认，先清洗。
-		upReq = sanitizeResponsesInput(in)
+		// Plan A：记录本轮放行的 reasoning id，上游报 caller 绑定失败时淘汰。
+		upReq, allowedReasoningIDs = sanitizeResponsesInputTracked(in)
 	} else if inFmt == FmtMessages {
 		// P1b-7：messages 同格式透传：清理多轮带回的杂散 signature 与顶层 thinking。
 		stripThinkingSignature(in)
@@ -381,6 +383,11 @@ func convHandlerInner(w http.ResponseWriter, req *http.Request, inner string, ze
 		// P1b-9：按客户端协议包规范 error envelope，不再原样透传。
 		// 同时把上游原文打到网关日志，定位校验失败原因（spark 1.3 400 专用）。
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 8<<10))
+		rawStr := strings.TrimSpace(string(raw))
+		// Plan A 反馈淘汰：caller 绑定失败说明放行的 id 已过期，逐出避免下轮再送。
+		if isCallerMismatch400(rawStr) {
+			evictIssued(allowedReasoningIDs...)
+		}
 		if len(raw) > 0 {
 			logf("[REQ %s] upstream %d body: %.800s", reqID, resp.StatusCode, strings.TrimSpace(string(raw)))
 		} else {
@@ -405,10 +412,10 @@ func convHandlerInner(w http.ResponseWriter, req *http.Request, inner string, ze
 		case inFmt == FmtResponses && target == FmtMessages:
 			streamMessagesToResponses(w, resp.Body, model)
 		default:
-			// 同格式：SSE 原样透传。
+			// 同格式：SSE 原样透传，顺带嗅探上游原生 reasoning id（Plan A 流式学习）。
 			w.Header().Set("Content-Type", "text/event-stream")
 			w.Header().Set("Cache-Control", "no-cache")
-			_, _ = io.Copy(w, resp.Body)
+			passthroughLearnSSE(w, resp.Body)
 		}
 		return
 	}
@@ -419,6 +426,8 @@ func convHandlerInner(w http.ResponseWriter, req *http.Request, inner string, ze
 		return
 	}
 	tDec = time.Now()
+	// Plan A：非流式响应先学习 reasoning id，再做逆转换/透传。
+	learnReasoningIDs(upResp)
 	out := upResp
 	if target != inFmt {
 		switch {
