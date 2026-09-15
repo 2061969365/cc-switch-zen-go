@@ -158,9 +158,21 @@ func parseSSEBlock(block []byte, handler func(event, data string)) {
 // 输出里，此处是上游→网关方向，不存在现编污染）。
 func passthroughLearnSSE(w io.Writer, r io.Reader) {
 	fl, _ := w.(http.Flusher)
+	// P1a-2 对齐：跟踪是否见过终态帧。无终态即 EOF = 上游异常断流，
+	// 此时禁止补 [DONE]（否则客户端把半截帧当正常结束解析，报
+	// Unterminated string），转 error 帧让客户端重试。
+	sawTerminal := false
 	pumpSSE(r, func(_, data string) {
 		ev := parseSSEData(data)
-		if ev != nil && asStr(ev["type"]) == "response.output_item.done" {
+		if ev == nil {
+			// 半截帧：pumpSSE 按 \n\n 切帧，EOF 残余会以整块回调；
+			// 解析失败说明上游断在帧中间，直接吞掉不透传。
+			return
+		}
+		switch asStr(ev["type"]) {
+		case "response.completed", "response.incomplete", "response.failed":
+			sawTerminal = true
+		case "response.output_item.done":
 			if item := asMap(ev["item"]); asStr(item["type"]) == "reasoning" {
 				if id := getStr(item, "id"); id != "" {
 					learnReasoningID(id)
@@ -172,7 +184,13 @@ func passthroughLearnSSE(w io.Writer, r io.Reader) {
 			fl.Flush()
 		}
 	})
-	_, _ = io.WriteString(w, "data: [DONE]\n\n")
+	if sawTerminal {
+		_, _ = io.WriteString(w, "data: [DONE]\n\n")
+	} else {
+		_, _ = io.WriteString(w, "event: error\ndata: "+
+			`{"type":"error","error":{"type":"upstream_error",`+
+			`"message":"upstream closed without terminal event"}}`+"\n\n")
+	}
 	if fl != nil {
 		fl.Flush()
 	}
