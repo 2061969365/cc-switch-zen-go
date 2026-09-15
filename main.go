@@ -374,21 +374,24 @@ func convHandlerInner(w http.ResponseWriter, req *http.Request, inner string, ze
 	}
 	upstream := *zenBase
 	upstream.Path = singleJoin(zenBase.Path, target.upstreamPath())
-	fwd, err := http.NewRequest(http.MethodPost, upstream.String(), bytes.NewReader(upBody))
-	if err != nil {
-		writeConvError(w, http.StatusBadGateway, "upstream unreachable")
-		return
+	// doUpstream 发往上游（首发与自愈重试共用）。
+	doUpstream := func(body []byte) (*http.Response, error) {
+		fwd, err := http.NewRequest(http.MethodPost, upstream.String(), bytes.NewReader(body))
+		if err != nil {
+			return nil, err
+		}
+		setZenHeaders(fwd.Header, apiKey, project)
+		// 最小验证：先透传客户端头，再补缺（setZenHeaders 内 setDefault 只补空位）。
+		inheritClientHeaders(fwd.Header, req.Header)
+		fwd.Header.Set("Content-Type", "application/json")
+		// P0-1：流式用无总超时的 client，非流式用 600s 总超时。
+		upstreamClient := zenClient
+		if stream {
+			upstreamClient = zenStreamClient
+		}
+		return upstreamClient.Do(fwd)
 	}
-	setZenHeaders(fwd.Header, apiKey, project)
-	// 最小验证：先透传客户端头，再补缺（setZenHeaders 内 setDefault 只补空位）。
-	inheritClientHeaders(fwd.Header, req.Header)
-	fwd.Header.Set("Content-Type", "application/json")
-	// P0-1：流式用无总超时的 client，非流式用 600s 总超时。
-	upstreamClient := zenClient
-	if stream {
-		upstreamClient = zenStreamClient
-	}
-	resp, err := upstreamClient.Do(fwd)
+	resp, err := doUpstream(upBody)
 	if err != nil {
 		logf("[REQ %s] Do err: %v", reqID, err)
 		writeConvError(w, http.StatusBadGateway, "upstream unreachable")
@@ -406,14 +409,40 @@ func convHandlerInner(w http.ResponseWriter, req *http.Request, inner string, ze
 		if isCallerMismatch400(rawStr) {
 			evictIssued(allowedReasoningIDs...)
 		}
-		if len(raw) > 0 {
-			logf("[REQ %s] upstream %d body: %.800s", reqID, resp.StatusCode, strings.TrimSpace(string(raw)))
-		} else {
-			logf("[REQ %s] upstream %d body: <empty>", reqID, resp.StatusCode)
+		// 自愈重试：caller 绑定失败且本轮放行过 reasoning（responses 同格式）时，
+		// 去串重发一次，把“用户手动重跑才好”变成网关自己消化。
+		// 重试点在向客户端写任何字节之前，流式/非流式均安全；仅重试一次。
+		retriedOK := false
+		if isCallerMismatch400(rawStr) && len(allowedReasoningIDs) > 0 && inFmt == FmtResponses {
+			logf("[REQ %s] caller-mismatch 400, evicted %d ids, retry without reasoning",
+				reqID, len(allowedReasoningIDs))
+			upReqRetry, _ := sanitizeResponsesInputTracked(in)
+			normalizeReasoningEffort(upReqRetry)
+			if upBodyRetry, merr := json.Marshal(upReqRetry); merr == nil {
+				if r2, rerr := doUpstream(upBodyRetry); rerr == nil {
+					resp = r2
+					defer resp.Body.Close()
+					tUp = time.Now()
+					upStatus = resp.StatusCode
+					allowedReasoningIDs = nil
+					if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+						retriedOK = true
+					} else {
+						raw, _ = io.ReadAll(io.LimitReader(resp.Body, 8<<10))
+					}
+				}
+			}
 		}
-		// 已消费 body，重包一个 Reader 给 writeUpstreamError 复用
-		writeUpstreamError(w, inFmt, resp.StatusCode, bytes.NewReader(raw))
-		return
+		if !retriedOK {
+			if len(raw) > 0 {
+				logf("[REQ %s] upstream %d body: %.800s", reqID, resp.StatusCode, strings.TrimSpace(string(raw)))
+			} else {
+				logf("[REQ %s] upstream %d body: <empty>", reqID, resp.StatusCode)
+			}
+			// 已消费 body，重包一个 Reader 给 writeUpstreamError 复用
+			writeUpstreamError(w, inFmt, resp.StatusCode, bytes.NewReader(raw))
+			return
+		}
 	}
 	if stream {
 		switch {
