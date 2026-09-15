@@ -109,6 +109,59 @@ func copyPassthrough(dst, src map[string]any, keys ...string) {
 	}
 }
 
+// ---------- v0.3.5 effort 归一化 ----------
+//
+// 背景：opencode 档位 low/medium/high/xhigh 中 max 非法（上游 400）；
+// 跨格式转换在 copyPassthrough 名单里丢了 reasoning.effort；
+// Anthropic 侧强度语义是 thinking.budget_tokens 而非 effort。
+// 约定（用户定）：max→high 降级；缺省 high；Anthropic 侧做翻译。
+
+// effortToBudget 把 responses effort 翻成 Anthropic budget_tokens。
+func effortToBudget(effort string) int {
+	switch effort {
+	case "low":
+		return 4096
+	case "medium":
+		return 16000
+	case "xhigh":
+		return 48000
+	default: // high 及未知一律 high
+		return 32000
+	}
+}
+
+// normalizeReasoningEffort 归一化 in 的 reasoning.effort 并写回：
+// max→high；缺 reasoning 或缺 effort 时补默认 high；只保留 effort 键
+// （summary 等不透传，避免伪造上游参数）。返回归一化后的 effort。
+func normalizeReasoningEffort(in map[string]any) string {
+	effort := "high"
+	if rm, ok := in["reasoning"].(map[string]any); ok {
+		if e := asStr(rm["effort"]); e != "" {
+			effort = e
+		}
+	}
+	if effort == "max" {
+		effort = "high"
+	}
+	switch effort {
+	case "low", "medium", "high", "xhigh":
+	default:
+		effort = "high"
+	}
+	in["reasoning"] = map[string]any{"effort": effort}
+	return effort
+}
+
+// applyThinkingBudget 把 effort 落到 messages 请求的 thinking 语义上：
+// 若输入自带合法 thinking 则透传不动；否则按 effort 翻 budget 并设置。
+func applyThinkingBudget(out, in map[string]any, effort string) {
+	if th, ok := in["thinking"].(map[string]any); ok && asStr(th["type"]) != "disabled" {
+		out["thinking"] = th
+		return
+	}
+	out["thinking"] = map[string]any{"type": "enabled", "budget_tokens": effortToBudget(effort)}
+}
+
 // ---------- P1b 请求清洗 ----------
 
 // filterPrivateParams 递归删除一切 "_" 开头私有字段，防
@@ -338,6 +391,8 @@ func chatToResponsesReq(in map[string]any) map[string]any {
 	}
 	// tool_choice / response_format：cc-switch 同样丢弃，不映射。
 	copyPassthrough(out, in, "temperature", "top_p", "stream")
+	// v0.3.5：chat->responses 补 effort（归一化，max→high，缺省 high）。
+	out["reasoning"] = map[string]any{"effort": normalizeReasoningEffort(in)}
 	return out
 }
 
@@ -468,6 +523,8 @@ func responsesToChatReq(in map[string]any) map[string]any {
 		out["max_tokens"] = v
 	}
 	copyPassthrough(out, in, "temperature", "top_p", "stream")
+	// v0.3.5：responses->chat 目标无 effort 语义，丢弃（归一化仅校验不写入）。
+	normalizeReasoningEffort(in)
 	return out
 }
 
@@ -617,6 +674,8 @@ func messagesToChatReq(in map[string]any) map[string]any {
 		out["stop"] = v
 	}
 	copyPassthrough(out, in, "max_tokens", "temperature", "top_p", "stream")
+	// v0.3.5：messages->chat 目标无 effort 语义，丢弃（归一化仅校验不写入）。
+	normalizeReasoningEffort(in)
 	return out
 }
 
@@ -759,6 +818,8 @@ func chatToMessagesReq(in map[string]any) map[string]any {
 		out["stop_sequences"] = v
 	}
 	copyPassthrough(out, in, "max_tokens", "temperature", "top_p", "stream")
+	// v0.3.5：chat->messages 目标用 thinking 语义，effort 翻 budget（自带 thinking 不动）。
+	applyThinkingBudget(out, in, normalizeReasoningEffort(in))
 	return out
 }
 
@@ -934,6 +995,8 @@ func messagesToResponsesReq(in map[string]any) map[string]any {
 		out["max_output_tokens"] = v
 	}
 	copyPassthrough(out, in, "temperature", "top_p", "stream")
+	// v0.3.5：messages->responses 补 effort（归一化，max→high，缺省 high）。
+	out["reasoning"] = map[string]any{"effort": normalizeReasoningEffort(in)}
 	return out
 }
 
@@ -1063,6 +1126,8 @@ func responsesToMessagesReq(in map[string]any) map[string]any {
 		out["max_tokens"] = v
 	}
 	copyPassthrough(out, in, "temperature", "top_p", "stream")
+	// v0.3.5：responses->messages 目标用 thinking 语义，effort 翻 budget（自带 thinking 不动）。
+	applyThinkingBudget(out, in, normalizeReasoningEffort(in))
 	return out
 }
 

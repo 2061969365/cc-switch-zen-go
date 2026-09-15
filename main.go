@@ -343,6 +343,8 @@ func convHandlerInner(w http.ResponseWriter, req *http.Request, inner string, ze
 		// reasoning/function_call 条目（rs_/fc_ 前缀 ID），上游不认，先清洗。
 		// Plan A：记录本轮放行的 reasoning id，上游报 caller 绑定失败时淘汰。
 		upReq, allowedReasoningIDs = sanitizeResponsesInputTracked(in)
+		// v0.3.5：同格式也归一化 effort（max→high，缺省 high），防非法档直达上游。
+		normalizeReasoningEffort(upReq)
 	} else if inFmt == FmtMessages {
 		// P1b-7：messages 同格式透传：清理多轮带回的杂散 signature 与顶层 thinking。
 		stripThinkingSignature(in)
