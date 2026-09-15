@@ -69,7 +69,7 @@ func TestCallerMismatchEvict(t *testing.T) {
 }
 
 func TestPassthroughLearnSSE(t *testing.T) {
-	// 上游原生 reasoning done 事件应被学到；透传字节应原样。
+	// 上游原生 reasoning done 事件应被学到；有终态时透传 + [DONE]。
 	raw := "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"reasoning\",\"id\":\"rs_stream_native\"}}\n\n" +
 		"data: {\"type\":\"response.completed\",\"response\":{}}\n\n"
 	var sb strings.Builder
@@ -82,6 +82,33 @@ func TestPassthroughLearnSSE(t *testing.T) {
 		t.Fatalf("透传不应改写帧: %q", out)
 	}
 	evictIssued("rs_stream_native")
+}
+
+func TestPassthroughTruncatedUpstream(t *testing.T) {
+	// 上游断在帧中间（无终态）：半截帧必须吞掉，不得透传；尾部应为 error 而非 [DONE]。
+	raw := "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"reasoning\",\"id\":\"rs_half\"" // 截断，无结尾
+	var sb strings.Builder
+	passthroughLearnSSE(&sb, strings.NewReader(raw))
+	out := sb.String()
+	if strings.Contains(out, "rs_half") {
+		t.Fatalf("半截帧不应透传: %q", out)
+	}
+	if strings.Contains(out, "[DONE]") {
+		t.Fatalf("无终态不应补 [DONE]: %q", out)
+	}
+	if !strings.Contains(out, "upstream closed without terminal event") {
+		t.Fatalf("无终态应发 error 帧: %q", out)
+	}
+	if isIssued("rs_half") {
+		t.Fatal("半截帧 id 不应被学习")
+	}
+	// 正常流（有终态）回归：透传 + [DONE] 不变。
+	raw2 := "data: {\"type\":\"response.completed\",\"response\":{}}\n\n"
+	var sb2 strings.Builder
+	passthroughLearnSSE(&sb2, strings.NewReader(raw2))
+	if !strings.Contains(sb2.String(), "[DONE]") {
+		t.Fatalf("有终态应补 [DONE]: %q", sb2.String())
+	}
 }
 
 func TestCrossFormatNoLeak(t *testing.T) {
