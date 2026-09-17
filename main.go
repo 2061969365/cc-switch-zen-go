@@ -302,6 +302,19 @@ func convHandlerInner(w http.ResponseWriter, req *http.Request, inner string, ze
 	var tRead, tConv1, tUp, tDec, tConv2 time.Time
 	var upStatus int
 	var allowedReasoningIDs []string
+	// v0.3.9-debug：记录下游会话（诊断 FreeTier 403 用：上游只认真实会话）。
+	// 取 x-opencode-session，无则取 X-Session-Id / x-session-affinity。
+	downSes := req.Header.Get("X-Opencode-Session")
+	if downSes == "" {
+		downSes = req.Header.Get("X-Session-Id")
+	}
+	if downSes == "" {
+		downSes = req.Header.Get("x-session-affinity")
+	}
+	downUA := req.Header.Get("User-Agent")
+	if len(downUA) > 60 {
+		downUA = downUA[:60]
+	}
 	defer func() {
 		ms := func(t time.Time) int64 {
 			if t.IsZero() {
@@ -309,8 +322,8 @@ func convHandlerInner(w http.ResponseWriter, req *http.Request, inner string, ze
 			}
 			return t.Sub(t0).Milliseconds()
 		}
-		logf("[REQ %s] %s model=%s stream=%v in=%s out=%s up=%d read=%dms conv1=%dms up=%dms dec=%dms conv2=%dms total=%dms",
-			reqID, inner, model, stream, inFmt, target, upStatus,
+		logf("[REQ %s] %s model=%s stream=%v in=%s out=%s up=%d ses=%s ua=%q read=%dms conv1=%dms up=%dms dec=%dms conv2=%dms total=%dms",
+			reqID, inner, model, stream, inFmt, target, upStatus, downSes, downUA,
 			ms(tRead), ms(tConv1), ms(tUp), ms(tDec), ms(tConv2), time.Since(t0).Milliseconds())
 	}()
 	tRead = time.Now()
