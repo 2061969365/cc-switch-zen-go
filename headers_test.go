@@ -46,6 +46,51 @@ func TestInheritKeepsNativeOpencodeSession(t *testing.T) {
 	}
 }
 
+// v0.3.10：签发结构必须合法（ses_ + 12hex + 14base62），否则上游 403。
+func TestMintSessionFormat(t *testing.T) {
+	for i := 0; i < 200; i++ {
+		id := mintID("ses")
+		if len(id) != 30 || !strings.HasPrefix(id, "ses_") {
+			t.Fatalf("长度/前缀错误：%q", id)
+		}
+		for _, c := range id[4:16] {
+			if !strings.ContainsRune("0123456789abcdef", c) {
+				t.Fatalf("时间部位非hex：%q", id)
+			}
+		}
+		for _, c := range id[16:30] {
+			if !strings.ContainsRune("0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz", c) {
+				t.Fatalf("随机部位非base62：%q", id)
+			}
+		}
+	}
+}
+
+// 固定时间戳可精确断言（ts=1ms, ctr=1 → current=0x1001）。
+func TestMintFixedTimestamp(t *testing.T) {
+	id := mintIDAt("ses", 1)
+	if !strings.HasPrefix(id, "ses_000000001001") {
+		t.Errorf("时间部位错误：%q", id)
+	}
+	a, b := mintID("msg"), mintID("msg")
+	if a == b {
+		t.Errorf("连续签发重复：%q", a)
+	}
+}
+
+// 回退签发也要合法（无会话下游不断 upstream 403）。
+func TestSetZenHeadersFallbackMintValid(t *testing.T) {
+	h := http.Header{}
+	setZenHeaders(h, "public", "default")
+	ses := h.Get("X-Opencode-Session")
+	if len(ses) != 30 || !strings.HasPrefix(ses, "ses_") {
+		t.Errorf("回退会话非法：%q", ses)
+	}
+	if req := h.Get("X-Opencode-Request"); len(req) != 30 || !strings.HasPrefix(req, "msg_") {
+		t.Errorf("回退请求非法：%q", req)
+	}
+}
+
 // 下游无任何会话头（curl 等）：保留现编值，防上游 MissingSessionID。
 func TestInheritFallbackFabricatedSession(t *testing.T) {
 	src := http.Header{}
@@ -54,5 +99,35 @@ func TestInheritFallbackFabricatedSession(t *testing.T) {
 	inheritClientHeaders(dst, src)
 	if got := dst.Get("X-Opencode-Session"); !strings.HasPrefix(got, "ses_") {
 		t.Errorf("回退现编值丢失：got %q", got)
+	}
+}
+
+// v0.3.10：非官方 UA 不得透传（上游连 UA 一起验），保留网关 zenUA。
+func TestInheritForeignUAReplaced(t *testing.T) {
+	src := http.Header{}
+	src.Set("User-Agent", "deepseek-harness/0.1.5-rc.2 (+https://github.com/test)")
+	src.Set("X-Session-Id", "ses_f53389880ffeCKjjiZ4JP2GyFA")
+
+	dst := http.Header{}
+	setZenHeaders(dst, "public", "default")
+	inheritClientHeaders(dst, src)
+	if got := dst.Get("User-Agent"); got != zenUA {
+		t.Errorf("外来 UA 透传了：got %q", got)
+	}
+	if got := dst.Get("X-Opencode-Session"); got != "ses_f53389880ffeCKjjiZ4JP2GyFA" {
+		t.Errorf("真会话丢失：got %q", got)
+	}
+}
+
+// 官方 UA 仍透传原值。
+func TestInheritOfficialUAPreserved(t *testing.T) {
+	src := http.Header{}
+	src.Set("User-Agent", "opencode/1.18.31 ai-sdk/provider-utils/4.0.40 runtime/bun/1.3.14")
+
+	dst := http.Header{}
+	setZenHeaders(dst, "public", "default")
+	inheritClientHeaders(dst, src)
+	if got := dst.Get("User-Agent"); !strings.HasPrefix(got, "opencode/1.18.31") {
+		t.Errorf("官方 UA 未保留：got %q", got)
 	}
 }

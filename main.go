@@ -86,7 +86,11 @@ func inheritClientHeaders(dst, src http.Header) {
 		}
 	}
 	if ua := src.Get("User-Agent"); ua != "" {
-		dst.Set("User-Agent", ua)
+		// v0.3.10：上游 FreeTier 连 UA 一起验（非 opencode/ 前缀必 403，实测）。
+		// 只有官方 UA 才透传，否则保留 setZenHeaders 的 zenUA。
+		if strings.HasPrefix(ua, "opencode/") {
+			dst.Set("User-Agent", ua)
+		}
 	}
 	// v0.3.8：真会话透传。test 等非 opencode provider 的下游不带 x-opencode-*，
 	// 只带 X-Session-Id / x-session-affinity（opencode request.ts else 分支）。
@@ -110,11 +114,11 @@ func setZenHeaders(h http.Header, apiKey, project string) {
 
 	h.Set("Authorization", "Bearer "+apiKey)
 	h.Set("User-Agent", zenUA)
-	tag := randHex(16)
 	// 客户端自带则保留（官方 opencode 直连本网关的场景）。
+	// v0.3.10：回退签发必须结构合法（mintID），旧 ses_+32hex 必吃上游 403。
 	setDefault(h, "X-Opencode-Client", "opencode")
-	setDefault(h, "X-Opencode-Session", "ses_"+tag)
-	setDefault(h, "X-Opencode-Request", "req_"+tag)
+	setDefault(h, "X-Opencode-Session", mintID("ses"))
+	setDefault(h, "X-Opencode-Request", mintID("msg"))
 	setDefault(h, "X-Opencode-Project", project)
 }
 func randHex(n int) string {
