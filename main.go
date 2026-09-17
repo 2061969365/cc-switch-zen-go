@@ -44,7 +44,7 @@ import (
 	"time"
 )
 
-const zenUA = "opencode/1.18.30"
+const zenUA = "opencode/1.18.31"
 
 // P0-1：上游共享连接池+超时。http.DefaultClient 无限等，上游 hang 住会拖死网关。
 // zenClient 用于非流式（总超时 600s）；zenStreamClient 用于 SSE/透传（长连接，无总超时）。
@@ -87,6 +87,17 @@ func inheritClientHeaders(dst, src http.Header) {
 	}
 	if ua := src.Get("User-Agent"); ua != "" {
 		dst.Set("User-Agent", ua)
+	}
+	// v0.3.8：真会话透传。test 等非 opencode provider 的下游不带 x-opencode-*，
+	// 只带 X-Session-Id / x-session-affinity（opencode request.ts else 分支）。
+	// 上游 FreeTier 只认真实会话（现编 ses_ 必 403，实测），故有真值时覆盖
+	// setZenHeaders 的现编值；缺失时保留现编值（防 MissingSessionID）。
+	if src.Get("X-Opencode-Session") == "" {
+		if sid := src.Get("X-Session-Id"); sid != "" {
+			dst.Set("X-Opencode-Session", sid)
+		} else if sid := src.Get("x-session-affinity"); sid != "" {
+			dst.Set("X-Opencode-Session", sid)
+		}
 	}
 }
 
