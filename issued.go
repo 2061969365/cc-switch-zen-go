@@ -127,8 +127,15 @@ func evictIssued(ids ...string) {
 	}
 }
 
-// isCallerMismatch400 上游 400 是否为 caller 绑定失败（需淘汰放行 id）。
+// isCallerMismatch400 上游 400 是否为 reasoning 绑定/过期失败
+//（需淘汰放行 id 并自愈重试）。覆盖三种上游措辞：
+//   - "was not issued to this caller"（异 caller 回放）
+//   - "invalid_encrypted_content"（串损坏）
+//   - "not found or has expired"（签发过但上游侧已失效，如复合 rs_A:rs_B id 过期）
+// 注意用带空格的 "not found or has expired" 做匹配，"model_not_found" 类
+// 下划线措辞不会误伤。
 func isCallerMismatch400(body string) bool {
 	return strings.Contains(body, "was not issued to this caller") ||
-		strings.Contains(body, "invalid_encrypted_content")
+		strings.Contains(body, "invalid_encrypted_content") ||
+		strings.Contains(body, "not found or has expired")
 }

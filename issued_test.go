@@ -58,8 +58,14 @@ func TestCallerMismatchEvict(t *testing.T) {
 	if !isCallerMismatch400("invalid_encrypted_content") {
 		t.Fatal("应识别 invalid_encrypted_content")
 	}
+	if !isCallerMismatch400("Referenced reasoning item 'rs_6aabda70054be95cf9bf4581:rs_01a0af4d471675fd86b0050a37b0475c' was not found or has expired") {
+		t.Fatal("应识别复合 id 过期")
+	}
 	if isCallerMismatch400("context_length_exceeded") {
 		t.Fatal("无关 400 不应误判")
+	}
+	if isCallerMismatch400("Model 'unknown' execution failed: model_not_found") {
+		t.Fatal("model_not_found 不应误判")
 	}
 	learnReasoningID("rs_rotated")
 	evictIssued("rs_rotated")
