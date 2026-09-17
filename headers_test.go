@@ -2,9 +2,11 @@
 package main
 
 import (
+	"io"
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 )
 
 // 下游是 test provider（无 x-opencode-*，只有 X-Session-Id）：上游必须拿到真会话。
@@ -100,6 +102,74 @@ func TestInheritFallbackFabricatedSession(t *testing.T) {
 	if got := dst.Get("X-Opencode-Session"); !strings.HasPrefix(got, "ses_") {
 		t.Errorf("回退现编值丢失：got %q", got)
 	}
+}
+
+// v0.3.11：空闲超时的包体必须按时报错，不能永久阻塞。
+func TestIdleTimeoutBodyFires(t *testing.T) {
+	pr, pw := io.Pipe()
+	defer pw.Close()
+	b := newIdleTimeoutBody(pr, 80*time.Millisecond)
+	defer b.Close()
+	start := time.Now()
+	buf := make([]byte, 64)
+	_, err := b.Read(buf)
+	if err == nil || time.Since(start) > 5*time.Second {
+		t.Fatalf("空闲超时未触发：err=%v elapsed=%v", err, time.Since(start))
+	}
+	if !strings.Contains(err.Error(), "idle timeout") {
+		t.Fatalf("错误不是超时：%v", err)
+	}
+	// 粘性：后续读同样报错。
+	if _, err2 := b.Read(buf); err2 == nil {
+		t.Fatalf("超时后应持续报错")
+	}
+}
+
+// 有数据流动时不超时；正常 EOF 透传。
+func TestIdleTimeoutBodyHealthy(t *testing.T) {
+	pr, pw := io.Pipe()
+	b := newIdleTimeoutBody(pr, 300*time.Millisecond)
+	defer b.Close()
+	go func() {
+		_, _ = pw.Write([]byte("data: x\n\n"))
+		time.Sleep(50 * time.Millisecond)
+		_, _ = pw.Write([]byte("data: y\n\n"))
+		pw.Close()
+	}()
+	var out []byte
+	tmp := make([]byte, 32)
+	for {
+		n, err := b.Read(tmp)
+		out = append(out, tmp[:n]...)
+		if err != nil {
+			break
+		}
+	}
+	if string(out) != "data: x\n\ndata: y\n\n" {
+		t.Errorf("数据损坏：%q", out)
+	}
+	// Close 幂等。
+	if err := b.Close(); err != nil {
+		t.Errorf("二次 Close 报错：%v", err)
+	}
+}
+
+// 不实现 Flusher 的 Writer 不得 panic。
+type bareWriter struct{ header http.Header }
+
+func (w *bareWriter) Header() http.Header         { return w.header }
+func (w *bareWriter) Write(b []byte) (int, error) { return len(b), nil }
+func (w *bareWriter) WriteHeader(int)             {}
+
+func TestNewSSESinkNoFlusher(t *testing.T) {
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("panic：%v", r)
+		}
+	}()
+	s := newSSESink(&bareWriter{header: http.Header{}})
+	s.emit(map[string]any{"type": "ping"})
+	s.done()
 }
 
 // v0.3.10：非官方 UA 不得透传（上游连 UA 一起验），保留网关 zenUA。

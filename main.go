@@ -31,6 +31,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -47,10 +48,15 @@ import (
 const zenUA = "opencode/1.18.31"
 
 // P0-1：上游共享连接池+超时。http.DefaultClient 无限等，上游 hang 住会拖死网关。
-// zenClient 用于非流式（总超时 600s）；zenStreamClient 用于 SSE/透传（长连接，无总超时）。
+// zenClient 用于非流式（总超时 600s）；zenStreamClient 用于 SSE/透传（长连接，无总超时，
+// 靠请求 ctx + 包体空闲超时兜底，见 AfterFunc 与 idleTimeoutBody）。
+// v0.3.11 并发隔离：空闲池 20→100（长流占连接是常态，小池加剧排队），
+// 总并发上限 200（防 fd/conntrack 爆，超限请求快速失败而非无限排队）。
 var zenTransport = &http.Transport{
 	Proxy:                 http.ProxyFromEnvironment, // 认 HTTP(S)_PROXY/NO_PROXY
-	MaxIdleConnsPerHost:   20,
+	MaxIdleConns:          100,
+	MaxIdleConnsPerHost:   100,
+	MaxConnsPerHost:       200,
 	IdleConnTimeout:       90 * time.Second,
 	TLSHandshakeTimeout:   30 * time.Second,
 	ResponseHeaderTimeout: 60 * time.Second,
@@ -211,7 +217,15 @@ func main() {
 	seedBuiltinTable()
 	go refreshTableFromOfficial()
 	// P0-3：全入口请求体上限 200MB（/conv 内部另有更严的 32MB）。
-	log.Fatal(http.ListenAndServe(addr, http.MaxBytesHandler(mux, 200<<20)))
+	// v0.3.11：ReadHeaderTimeout 防慢头占连接；IdleTimeout 只杀空闲 keep-alive，
+	// 不影响进行中的 SSE 长流（WriteTimeout 故意不设，设了会砍断正常流）。
+	srv := &http.Server{
+		Addr:              addr,
+		Handler:           http.MaxBytesHandler(mux, 200<<20),
+		ReadHeaderTimeout: 30 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
+	log.Fatal(srv.ListenAndServe())
 }
 
 func setDefault(h http.Header, key, value string) {
@@ -261,7 +275,8 @@ func convHandlerInner(w http.ResponseWriter, req *http.Request, inner string, ze
 	if inner == "/v1/models" && req.Method == http.MethodGet {
 		upstream := *zenBase
 		upstream.Path = singleJoin(zenBase.Path, "/models")
-		fwd, err := http.NewRequest(http.MethodGet, upstream.String(), nil)
+		// v0.3.11：绑下游 ctx，客户端断开即放上游连接。
+		fwd, err := http.NewRequestWithContext(req.Context(), http.MethodGet, upstream.String(), nil)
 		if err != nil {
 			writeConvError(w, http.StatusBadGateway, "upstream unreachable")
 			return
@@ -403,8 +418,10 @@ func convHandlerInner(w http.ResponseWriter, req *http.Request, inner string, ze
 	upstream := *zenBase
 	upstream.Path = singleJoin(zenBase.Path, target.upstreamPath())
 	// doUpstream 发往上游（首发与自愈重试共用）。
+	// v0.3.11：绑下游 req.Context()，客户端断开/超时即取消上游请求，
+	// 不再靠 handler 返回才释放（此前 Background 导致断开也泄漏连接）。
 	doUpstream := func(body []byte) (*http.Response, error) {
-		fwd, err := http.NewRequest(http.MethodPost, upstream.String(), bytes.NewReader(body))
+		fwd, err := http.NewRequestWithContext(req.Context(), http.MethodPost, upstream.String(), bytes.NewReader(body))
 		if err != nil {
 			return nil, err
 		}
@@ -426,6 +443,11 @@ func convHandlerInner(w http.ResponseWriter, req *http.Request, inner string, ze
 		return
 	}
 	defer resp.Body.Close()
+	// v0.3.11：下游断开即关上游包体，卡在 pumpSSE/r.Read 的 goroutine 立刻报错
+	// 退出，连接回池。Body.Close 多次调用安全；重试分支各自 defer 不动。
+	// 闭包捕获 resp 变量，重试后指向最新 body，旧 body 由上一行 defer 收。
+	stopUpstream := context.AfterFunc(req.Context(), func() { resp.Body.Close() })
+	defer stopUpstream()
 	tUp = time.Now()
 	upStatus = resp.StatusCode
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
@@ -473,24 +495,29 @@ func convHandlerInner(w http.ResponseWriter, req *http.Request, inner string, ze
 		}
 	}
 	if stream {
+		// v0.3.11：包体空闲超时。ResponseHeaderTimeout 只保响应头，
+		// 上游中途 stall（有连接、无字节、无EOF）此前永久挂起。
+		// 超时走各路径既有 error 收尾，不伪造 DONE。
+		sbody := newIdleTimeoutBody(resp.Body, streamIdleTimeout())
+		defer sbody.Close()
 		switch {
 		case inFmt == FmtChat && target == FmtResponses:
-			streamResponsesToChat(w, resp.Body, model)
+			streamResponsesToChat(w, sbody, model)
 		case inFmt == FmtResponses && target == FmtChat:
-			streamChatToResponses(w, resp.Body, model)
+			streamChatToResponses(w, sbody, model)
 		case inFmt == FmtMessages && target == FmtChat:
-			streamChatToMessages(w, resp.Body, model)
+			streamChatToMessages(w, sbody, model)
 		case inFmt == FmtChat && target == FmtMessages:
-			streamMessagesToChat(w, resp.Body, model)
+			streamMessagesToChat(w, sbody, model)
 		case inFmt == FmtMessages && target == FmtResponses:
-			streamResponsesToMessages(w, resp.Body, model)
+			streamResponsesToMessages(w, sbody, model)
 		case inFmt == FmtResponses && target == FmtMessages:
-			streamMessagesToResponses(w, resp.Body, model)
+			streamMessagesToResponses(w, sbody, model)
 		default:
 			// 同格式：SSE 原样透传，顺带嗅探上游原生 reasoning id（Plan A 流式学习）。
 			w.Header().Set("Content-Type", "text/event-stream")
 			w.Header().Set("Cache-Control", "no-cache")
-			passthroughLearnSSE(w, resp.Body)
+			passthroughLearnSSE(w, sbody)
 		}
 		return
 	}

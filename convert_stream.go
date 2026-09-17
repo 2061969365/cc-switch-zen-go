@@ -10,9 +10,14 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
+	"os"
+	"strconv"
 	"strings"
+	"sync"
+	"time"
 )
 
 // ---------- SSE 收发 ----------
@@ -27,7 +32,96 @@ func newSSESink(w http.ResponseWriter) *sseSink {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
-	return &sseSink{w: w, f: w.(http.Flusher)}
+	// v0.3.11：comma-ok，不实现 Flusher 的 Writer（如某些中间件/单测桩）
+	// 不再 panic，退化为直写。
+	fl, _ := w.(http.Flusher)
+	if fl == nil {
+		fl = noopFlusher{}
+	}
+	return &sseSink{w: w, f: fl}
+}
+
+type noopFlusher struct{}
+
+func (noopFlusher) Flush() {}
+
+// idleTimeoutBody：上游包体超过 idle 无字节即关闭并报超时错，防止 stall
+// 钉死 handler goroutine + 上游连接（zenStreamClient 无总超时）。
+// 用法：包在 resp.Body 外层再传给各 stream*/passthroughLearnSSE；
+// 调用方 defer Close。超时后走各路径既有的 error 帧收尾，不伪造 DONE。
+// 超时秒数读 STREAM_IDLE_TIMEOUT_SEC，缺省 120，非法值回缺省。
+type idleTimeoutBody struct {
+	rc       io.ReadCloser
+	idle     time.Duration
+	mu       sync.Mutex
+	timer    *time.Timer
+	timedOut bool
+	closed   bool
+}
+
+func streamIdleTimeout() time.Duration {
+	if v := os.Getenv("STREAM_IDLE_TIMEOUT_SEC"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return time.Duration(n) * time.Second
+		}
+	}
+	return 120 * time.Second
+}
+
+func newIdleTimeoutBody(rc io.ReadCloser, idle time.Duration) *idleTimeoutBody {
+	b := &idleTimeoutBody{rc: rc, idle: idle}
+	if idle > 0 {
+		b.timer = time.AfterFunc(idle, b.onIdle)
+	}
+	return b
+}
+
+func (b *idleTimeoutBody) onIdle() {
+	b.mu.Lock()
+	if b.closed || b.timedOut {
+		b.mu.Unlock()
+		return
+	}
+	b.timedOut = true
+	rc := b.rc
+	b.mu.Unlock()
+	_ = rc.Close() // 打断正在阻塞的 Read；http body 并发 Close 安全
+}
+
+func (b *idleTimeoutBody) Read(p []byte) (int, error) {
+	n, err := b.rc.Read(p)
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.timedOut {
+		return 0, errors.New("upstream idle timeout")
+	}
+	if b.closed {
+		return n, err
+	}
+	if n > 0 {
+		if b.timer != nil {
+			b.timer.Reset(b.idle)
+		}
+	}
+	if err != nil && b.timer != nil {
+		b.timer.Stop()
+	}
+	return n, err
+}
+
+func (b *idleTimeoutBody) Close() error {
+	b.mu.Lock()
+	if b.closed {
+		b.mu.Unlock()
+		return nil
+	}
+	b.closed = true
+	if b.timer != nil {
+		b.timer.Stop()
+	}
+	rc := b.rc
+	b.mu.Unlock()
+	return rc.Close()
 }
 
 func (s *sseSink) emit(v any) {
