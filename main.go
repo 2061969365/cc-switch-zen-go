@@ -185,7 +185,7 @@ func main() {
 	// /health：容器/Railway 健康检查用，固定 200。
 	mux.HandleFunc("/health", func(w http.ResponseWriter, req *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"status":"ok","shim":"v4"}`))
+		_, _ = w.Write([]byte(`{"status":"ok","shim":"v5"}`))
 	})
 	// /conv/* 兼容别名：与 /v1 同逻辑（模型感知自动转换）。
 	mux.HandleFunc("/conv/", func(w http.ResponseWriter, req *http.Request) {
