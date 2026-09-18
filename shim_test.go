@@ -95,11 +95,11 @@ func TestShimFingerprint(t *testing.T) {
 
 // 空文本 → incomplete；有文本 → completed 且 output 结构对。
 func TestShimEnvelope(t *testing.T) {
-	e0 := shimEnvelope("resp_1", "m", "")
+	e0 := shimEnvelope("resp_1", "m", "", shimUsage{})
 	if e0["status"] != "incomplete" {
 		t.Errorf("空文本应 incomplete：%v", e0["status"])
 	}
-	e1 := shimEnvelope("resp_2", "m", "hello")
+	e1 := shimEnvelope("resp_2", "m", "hello", shimUsage{input: 10, output: 5, total: 15})
 	if e1["status"] != "completed" {
 		t.Errorf("有文本应 completed：%v", e1["status"])
 	}
@@ -155,9 +155,9 @@ func TestShimBypassRouting(t *testing.T) {	official := []string{
 // Delta chunks must reassemble to the original text.
 func TestShimEmitStreamSequence(t *testing.T) {
  longText := strings.Repeat("ab", 600) + "end"
- env := shimEnvelope("resp_seq1", "m", longText)
+ env := shimEnvelope("resp_seq1", "m", longText, shimUsage{})
  rec := httptest.NewRecorder()
- shimEmitStream(rec, "resp_seq1", "m", env)
+ shimEmitStream(rec, "resp_seq1", "m", env, shimUsage{})
  body := rec.Body.String()
  if !strings.Contains(body, "data: [DONE]") {
  t.Fatalf("missing [DONE] tail")
@@ -210,5 +210,19 @@ func TestShimAgentDefault(t *testing.T) {
  t.Setenv("SHIM_AGENT", "plan")
  if got := shimAgent(); got != "plan" {
  t.Fatalf("SHIM_AGENT override failed, got %q", got)
+ }
+}
+
+// step_finish tokens map to responses usage fields.
+func TestShimUsageOf(t *testing.T) {
+ ev := map[string]any{"part": map[string]any{"tokens": map[string]any{
+ "total": float64(100), "input": float64(80), "output": float64(20),
+ }}}
+ u := shimUsageOf(ev)
+ if u.input != 80 || u.output != 20 || u.total != 100 {
+ t.Fatalf("usage mapping wrong: %+v", u)
+ }
+ if got := shimUsageOf(map[string]any{}); got.total != 0 {
+ t.Fatalf("empty event should give zero usage: %+v", got)
  }
 }
