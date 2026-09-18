@@ -185,7 +185,7 @@ func main() {
 	// /health：容器/Railway 健康检查用，固定 200。
 	mux.HandleFunc("/health", func(w http.ResponseWriter, req *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"status":"ok"}`))
+		_, _ = w.Write([]byte(`{"status":"ok","shim":"v3"}`))
 	})
 	// /conv/* 兼容别名：与 /v1 同逻辑（模型感知自动转换）。
 	mux.HandleFunc("/conv/", func(w http.ResponseWriter, req *http.Request) {
@@ -199,6 +199,12 @@ func main() {
 			return
 		}
 		// 三个 POST 入口直接按模型自动转换（未知模型透传，保持旧行为）。
+		// v0.3.12：非官方 UA 的 /v1/responses 进 shim 旁路（opencode run 借身份），
+		// harness 零改动；官方 UA 走老链路，本体零影响。
+		if req.Method == http.MethodPost && req.URL.Path == "/v1/responses" && shimEnabled() && !isOfficialUA(req.Header.Get("User-Agent")) {
+			shimHandler(w, req)
+			return
+		}
 		if req.Method == http.MethodPost && convInputFormat(req.URL.Path) != "" {
 			convHandlerInner(w, req, req.URL.Path, zenBase, apiKey, project)
 			return
