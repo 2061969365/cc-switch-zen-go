@@ -308,3 +308,51 @@ func TestShimSessionLRU(t *testing.T) {
  shimSesQ = nil
  shimSesMu.Unlock()
 }
+
+// Model whitelist: normal names pass, cmd metachars rejected.
+func TestValidShimModel(t *testing.T) {
+ for _, m := range []string{"test/muse-spark-1.3-contributor-free", "openai/gpt-4o", "a.b_c:d-e/f1"} {
+ if !validShimModel(m) {
+ t.Errorf("legit model rejected: %q", m)
+ }
+ }
+ for _, m := range []string{"", "a&b", "a|b", "a;b", "a b", "a$b", "`id`", "$(x)", "a\n", strings.Repeat("a", 129)} {
+ if validShimModel(m) {
+ t.Errorf("dangerous model accepted: %q", m)
+ }
+ }
+}
+
+// cutStr must not split multibyte runes.
+func TestCutStrRuneSafe(t *testing.T) {
+ s := "abc中文def"
+ if got := cutStr(s, 5); got != "abc中文" {
+ t.Fatalf("rune cut wrong: %q", got)
+ }
+ if got := cutStr(s, 100); got != s {
+ t.Fatalf("short string altered: %q", got)
+ }
+}
+
+// Store on existing key must LRU-touch (hot sessions survive eviction).
+func TestShimStoreTouch(t *testing.T) {
+ shimSesMu.Lock()
+ shimSes = map[string]*shimSesEntry{}
+ shimSesQ = nil
+ shimSesMu.Unlock()
+ for i := 0; i < 64; i++ {
+ shimStoreSession("s-"+string(rune('a'+i%26))+string(rune('0'+i/26)), "ses")
+ }
+ shimStoreSession("s-a0", "ses-new")
+ shimStoreSession("s-fresh", "ses-fresh")
+ if got := shimLookupSession("s-a0"); got != "ses-new" {
+ t.Fatalf("stored value lost: %q", got)
+ }
+ if got := shimLookupSession("s-b0"); got != "" {
+ t.Fatalf("LRU victim wrong, s-b0 should be evicted, got %q", got)
+ }
+ shimSesMu.Lock()
+ shimSes = map[string]*shimSesEntry{}
+ shimSesQ = nil
+ shimSesMu.Unlock()
+}
