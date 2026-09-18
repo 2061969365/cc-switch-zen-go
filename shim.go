@@ -417,19 +417,16 @@ func shimCmdArgs(prompt, sessionID, model string) (args []string, stdin *strings
 	if sessionID != "" {
 		args = append(args, "-s", sessionID)
 	}
-	// 长 prompt 走 stdin（Windows 命令行上限 32767 字符）。
-	if len(prompt) > 20000 {
-		return append(args, "-"), strings.NewReader(prompt)
-	}
-	return append(args, prompt), nil
+	// prompt 永远走 stdin：cmd.exe /c 命令行 8191 上限会腰斩 8KB+ 的 argv prompt
+	// （exit 1 + 多字节截断乱码）；stdin 是 pipe 流，无此限。不传 message positional，
+	// opencode 侧 resolveRunInput 直接取 piped，无 "-" 占位污染。
+	return args, strings.NewReader(prompt)
 }
 
 func shimRunOpencode(ctx context.Context, prompt, sessionID, model string) shimResult {
 	args, stdin := shimCmdArgs(prompt, sessionID, model)
 	cmd := exec.CommandContext(ctx, "cmd.exe", args...)
-	if stdin != nil {
-		cmd.Stdin = stdin
-	}
+	cmd.Stdin = stdin
 	var outBuf, errBuf bytes.Buffer
 	// stdout 可能很大（system prompt 回显），上限 8MB 截断防 OOM。
 	cmd.Stdout = &limitedWriter{w: &outBuf, n: 8 << 20}
@@ -502,9 +499,7 @@ func shimStreamLive(ctx context.Context, w http.ResponseWriter, reqID, model, pr
 			"content": []any{map[string]any{"type": "output_text", "text": "", "annotations": []any{}}}}})
 	args, stdin := shimCmdArgs(prompt, ses, model)
 	cmd := exec.CommandContext(ctx, "cmd.exe", args...)
-	if stdin != nil {
-		cmd.Stdin = stdin
-	}
+	cmd.Stdin = stdin
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return shimLiveResult{errMsg: "stdout pipe: " + err.Error()}
@@ -689,8 +684,8 @@ func shimHandler(w http.ResponseWriter, req *http.Request) {
 		if lr.sessionID != "" {
 			shimStoreSession(fp, lr.sessionID)
 		}
-		logf("[SHIM %s] LIVE done ok ms=%d firstByte=%dms textLen=%d in=%d out=%d ses=%s cont=%s ua=%q",
-			reqID, elms, lr.firstByteMs, len(lr.text), lr.usage.input, lr.usage.output, lr.sessionID, cont, downUA)
+		logf("[SHIM %s] LIVE done ok ms=%d firstByte=%dms promptBytes=%d textLen=%d in=%d out=%d ses=%s cont=%s ua=%q",
+			reqID, elms, lr.firstByteMs, len(prompt), len(lr.text), lr.usage.input, lr.usage.output, lr.sessionID, cont, downUA)
 		return
 	}
 	r := shimRunOpencode(ctx, prompt, ses, model)
@@ -719,7 +714,7 @@ func shimHandler(w http.ResponseWriter, req *http.Request) {
 		shimStoreSession(fp, r.sessionID)
 	}
 	env := shimEnvelope(reqID, model, r.text, r.usage)
-	logf("[SHIM %s] done ok ms=%d textLen=%d in=%d out=%d ses=%s cont=%s ua=%q", reqID, elms, len(r.text), r.usage.input, r.usage.output, r.sessionID, cont, downUA)
+	logf("[SHIM %s] done ok ms=%d promptBytes=%d textLen=%d in=%d out=%d ses=%s cont=%s ua=%q", reqID, elms, len(prompt), len(r.text), r.usage.input, r.usage.output, r.sessionID, cont, downUA)
 	w.Header().Set("Content-Type", "application/json")
 	b, _ := json.Marshal(env)
 	_, _ = w.Write(b)

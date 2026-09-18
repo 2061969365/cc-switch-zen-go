@@ -3,6 +3,7 @@ package main
 
 import (
 	"encoding/json"
+	"io"
 	"net/http/httptest"
 	"os"
 	"strings"
@@ -224,5 +225,29 @@ func TestShimUsageOf(t *testing.T) {
  }
  if got := shimUsageOf(map[string]any{}); got.total != 0 {
  t.Fatalf("empty event should give zero usage: %+v", got)
+ }
+}
+
+// prompt永远走stdin：短/中/长均stdin非空、argv不含prompt内容。
+func TestShimCmdArgsAlwaysStdin(t *testing.T) {
+ prompts := map[string]string{
+ "short": "hi",
+ "mid": strings.Repeat("ab", 5000),
+ "long": strings.Repeat("ab", 20000),
+ }
+ for name, p := range prompts {
+ args, stdin := shimCmdArgs(p, "", "test/m")
+ if stdin == nil {
+ t.Fatalf("%s: stdin must never be nil", name)
+ }
+ var sb strings.Builder
+ if _, err := io.Copy(&sb, stdin); err != nil || sb.String() != p {
+ t.Fatalf("%s: stdin content mismatch", name)
+ }
+ for _, a := range args {
+ if a == p {
+ t.Fatalf("%s: prompt leaked into argv", name)
+ }
+ }
  }
 }
