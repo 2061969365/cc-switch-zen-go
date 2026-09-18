@@ -22,6 +22,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -112,12 +113,15 @@ func shimFindOpencode() (string, error) {
 
 func shimBackendOK() error {
 	shimBackendOnce.Do(func() {
-		// Windows 上 opencode 是 npm 垫片（opencode.cmd），经 cmd /c 调用；
-		// 此处只探测存在性。
+	// Windows 上 opencode 是 npm 垫片（opencode.cmd），经 cmd /c 调用；
+	// Linux 上 npm 全局 bin 是带 shebang 的可执行脚本，直接调。
+	// 此处只探测存在性。
+	if runtime.GOOS == "windows" {
 		if _, err := exec.LookPath("cmd.exe"); err != nil {
 			shimBackendErr = fmt.Errorf("cmd.exe not found: %v", err)
 			return
 		}
+	}
 		bin, err := shimFindOpencode()
 		if err != nil {
 			shimBackendErr = err
@@ -553,22 +557,35 @@ func shimEffortVariant(body map[string]any) string {
 }
 
 func shimCmdArgs(prompt, sessionID, model, variant string) (args []string, stdin *strings.Reader) {
-	args = []string{"/c", shimOpencodeBin, "run", "--pure", "--format", "json", "--thinking", "--agent", shimAgent(), "-m", model}
+	args = []string{shimOpencodeBin, "run", "--pure", "--format", "json", "--thinking", "--agent", shimAgent(), "-m", model}
 	if variant != "" {
 		args = append(args, "--variant", variant)
 	}
 	if sessionID != "" {
 		args = append(args, "-s", sessionID)
 	}
-	// prompt 永远走 stdin：cmd.exe /c 命令行 8191 上限会腰斩 8KB+ 的 argv prompt
+	// prompt 永远走 stdin：Windows cmd.exe /c 命令行 8191 上限会腰斩 8KB+ 的 argv prompt
 	// （exit 1 + 多字节截断乱码）；stdin 是 pipe 流，无此限。不传 message positional，
 	// opencode 侧 resolveRunInput 直接取 piped，无 "-" 占位污染。
 	return args, strings.NewReader(prompt)
 }
 
+// shimLaunchFor 按平台拼启动器：windows 经 cmd.exe /c（npm .cmd 垫片必须），
+// linux 直接 exec 可执行文件。goos 参数化便于单测两边。
+func shimLaunchFor(goos string, args []string) (string, []string) {
+	if goos == "windows" {
+		return "cmd.exe", append([]string{"/c"}, args...)
+	}
+	return args[0], args[1:]
+}
+
+// shimLaunch 本机平台启动器。
+func shimLaunch(args []string) (string, []string) { return shimLaunchFor(runtime.GOOS, args) }
+
 func shimRunOpencode(ctx context.Context, prompt, sessionID, model, variant string) shimResult {
 	args, stdin := shimCmdArgs(prompt, sessionID, model, variant)
-	cmd := exec.CommandContext(ctx, "cmd.exe", args...)
+	launcher, largs := shimLaunch(args)
+	cmd := exec.CommandContext(ctx, launcher, largs...)
 	cmd.Stdin = stdin
 	var outBuf, errBuf bytes.Buffer
 	// stdout 可能很大（system prompt 回显），上限 8MB 截断防 OOM。
@@ -615,8 +632,8 @@ func tailString(s string, n int) string {
 	return s[len(s)-n:]
 }
 
-// validShimModel 字符集白名单：model 原样进 cmd.exe /c argv，
-// 白名单外（&|<>" 等）会被 cmd 二次解析，直接 400。
+// validShimModel 字符集白名单：model 原样进子进程 argv，
+// Windows 经 cmd.exe /c 二次解析，白名单外（&|<>" 等）直接 400。
 func validShimModel(m string) bool {
 	if m == "" || len(m) > 128 {
 		return false
@@ -688,7 +705,8 @@ func shimStreamLive(ctx context.Context, w http.ResponseWriter, reqID, model, va
 		"item": map[string]any{"id": msgID, "type": "message", "role": "assistant",
 			"content": []any{map[string]any{"type": "output_text", "text": "", "annotations": []any{}}}}})
 	args, stdin := shimCmdArgs(prompt, ses, model, variant)
-	cmd := exec.CommandContext(ctx, "cmd.exe", args...)
+	launcher, largs := shimLaunch(args)
+	cmd := exec.CommandContext(ctx, launcher, largs...)
 	cmd.Stdin = stdin
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
