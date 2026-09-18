@@ -284,8 +284,16 @@ func shimStoreSession(fp, ses string) {
 	shimSesMu.Lock()
 	defer shimSesMu.Unlock()
 	if e, ok := shimSes[fp]; ok {
+		// 已存在同样 LRU touch，否则热会话会被当最旧逐出。
 		e.sessionID = ses
 		e.lastSeen = time.Now()
+		for i, k := range shimSesQ {
+			if k == fp {
+				shimSesQ = append(shimSesQ[:i], shimSesQ[i+1:]...)
+				break
+			}
+		}
+		shimSesQ = append(shimSesQ, fp)
 		return
 	}
 	shimSes[fp] = &shimSesEntry{sessionID: ses, lastSeen: time.Now()}
@@ -500,6 +508,33 @@ func tailString(s string, n int) string {
 	return s[len(s)-n:]
 }
 
+// validShimModel 字符集白名单：model 原样进 cmd.exe /c argv，
+// 白名单外（&|<>" 等）会被 cmd 二次解析，直接 400。
+func validShimModel(m string) bool {
+	if m == "" || len(m) > 128 {
+		return false
+	}
+	for _, r := range m {
+		if !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' ||
+			r == '.' || r == '_' || r == ':' || r == '/' || r == '-') {
+			return false
+		}
+	}
+	return true
+}
+
+// cutStr 按 rune 边界截断（日志 UA 防 mojibake：按字节切会劈开多字节字符）。
+func cutStr(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	return string(r[:n])
+}
+
 // shimLiveResult P0 直播结果。
 type shimLiveResult struct {
 	text        string
@@ -507,6 +542,7 @@ type shimLiveResult struct {
 	usage       shimUsage
 	ok          bool
 	timeout     bool
+	cancelled   bool
 	errMsg      string
 	firstByteMs int64
 }
@@ -579,6 +615,7 @@ func shimStreamLive(ctx context.Context, w http.ResponseWriter, reqID, model, pr
 		}
 	}
 	text := strings.Join(texts, "")
+	scanErr := sc.Err()
 	waitErr := cmd.Wait()
 	if ctx.Err() == context.DeadlineExceeded {
 		r.timeout = true
@@ -586,6 +623,21 @@ func shimStreamLive(ctx context.Context, w http.ResponseWriter, reqID, model, pr
 		sink.emit(map[string]any{"type": "response.failed",
 			"response": map[string]any{"id": reqID, "status": "failed",
 				"error": map[string]any{"type": "timeout", "message": "shim timeout"}}})
+		sink.done()
+		return r
+	}
+	if ctx.Err() == context.Canceled {
+		// 下游先挂：不再向死连接补帧，只记分类日志（handler 侧）。
+		r.cancelled = true
+		r.errMsg = "client cancelled"
+		return r
+	}
+	if scanErr != nil {
+		// 超长行/IO错：此前当 ok:true 半截回吐，现显式失败。
+		r.errMsg = "stdout scan: " + scanErr.Error()
+		sink.emit(map[string]any{"type": "response.failed",
+			"response": map[string]any{"id": reqID, "status": "failed",
+				"error": map[string]any{"type": "shim_error", "message": r.errMsg}}})
 		sink.done()
 		return r
 	}
@@ -602,6 +654,16 @@ func shimStreamLive(ctx context.Context, w http.ResponseWriter, reqID, model, pr
 	}
 	r.ok = true
 	r.text, r.sessionID, r.usage = text, sessionID, usage
+	if strings.TrimSpace(text) == "" {
+		// exit 0 但零输出：此前伪造成 completed，下游空渲染；现显式失败。
+		r.ok = false
+		r.errMsg = "shim_empty: opencode exited 0 with no text output"
+		sink.emit(map[string]any{"type": "response.failed",
+			"response": map[string]any{"id": reqID, "status": "failed",
+				"error": map[string]any{"type": "shim_empty", "message": r.errMsg}}})
+		sink.done()
+		return r
+	}
 	doneItem := map[string]any{"id": msgID, "type": "message", "role": "assistant",
 		"content": []any{map[string]any{"type": "output_text", "text": text, "annotations": []any{}}}}
 	sink.emit(map[string]any{"type": "response.output_item.done", "output_index": 0, "item": doneItem})
@@ -665,6 +727,11 @@ func shimHandler(w http.ResponseWriter, req *http.Request) {
 		// opencode run -m 要求 provider/ 前缀，无则补 test/（已实测无前缀 exit 1）。
 		model = "test/" + model
 	}
+	if !validShimModel(model) {
+		// model 直进 cmd.exe /c argv，字符集外一律 400（防 cmd 二次解析）。
+		writeConvError(w, http.StatusBadRequest, "invalid model")
+		return
+	}
 	// 会话钉定：x-session-id 头优先，同对话续 -s 只发增量；新对话拼全量。
 	// 无提示词注入：harness 的 instructions/input 原样转文本，不附加任何附录。
 	fp := shimSessionKey(req.Header, in)
@@ -679,10 +746,7 @@ func shimHandler(w http.ResponseWriter, req *http.Request) {
 		writeConvError(w, http.StatusBadRequest, "empty prompt")
 		return
 	}
-	downUA := req.Header.Get("User-Agent")
-	if len(downUA) > 60 {
-		downUA = downUA[:60]
-	}
+	downUA := cutStr(req.Header.Get("User-Agent"), 60)
 	// 小并发信号量：满时阻塞等待，下游断开即放弃（不占坑）。
 	select {
 	case shimSem <- struct{}{}:
@@ -702,11 +766,15 @@ func shimHandler(w http.ResponseWriter, req *http.Request) {
 			cont = "yes"
 		}
 		if lr.timeout {
-			logf("[SHIM %s] LIVE TIMEOUT ms=%d firstByte=%dms ua=%q", reqID, elms, lr.firstByteMs, downUA)
+			logf("[SHIM %s] LIVE TIMEOUT ms=%d firstByte=%dms promptBytes=%d ses=%s cont=%s ua=%q", reqID, elms, lr.firstByteMs, len(prompt), ses, cont, downUA)
+			return
+		}
+		if lr.cancelled {
+			logf("[SHIM %s] LIVE CLIENT-CANCELLED ms=%d firstByte=%dms promptBytes=%d ses=%s cont=%s ua=%q", reqID, elms, lr.firstByteMs, len(prompt), ses, cont, downUA)
 			return
 		}
 		if !lr.ok {
-			logf("[SHIM %s] LIVE ERROR ms=%d firstByte=%dms ua=%q err=%.200s", reqID, elms, lr.firstByteMs, downUA, lr.errMsg)
+			logf("[SHIM %s] LIVE ERROR ms=%d firstByte=%dms promptBytes=%d ses=%s cont=%s ua=%q err=%.200s", reqID, elms, lr.firstByteMs, len(prompt), ses, cont, downUA, lr.errMsg)
 			return
 		}
 		if lr.sessionID != "" {
@@ -723,7 +791,7 @@ func shimHandler(w http.ResponseWriter, req *http.Request) {
 		cont = "yes"
 	}
 	if r.timeout {
-		logf("[SHIM %s] TIMEOUT ms=%d ua=%q", reqID, elms, downUA)
+		logf("[SHIM %s] TIMEOUT ms=%d promptBytes=%d ses=%s cont=%s ua=%q", reqID, elms, len(prompt), ses, cont, downUA)
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusGatewayTimeout)
 		b, _ := json.Marshal(map[string]any{"error": map[string]any{"type": "shim_timeout", "message": r.errMsg}})
@@ -731,10 +799,20 @@ func shimHandler(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 	if !r.ok {
-		logf("[SHIM %s] ERROR ms=%d ua=%q err=%.200s", reqID, elms, downUA, r.errMsg)
+		logf("[SHIM %s] ERROR ms=%d promptBytes=%d ses=%s cont=%s ua=%q err=%.200s", reqID, elms, len(prompt), ses, cont, downUA, r.errMsg)
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusBadGateway)
 		b, _ := json.Marshal(map[string]any{"error": map[string]any{"type": "shim_error", "message": r.errMsg}})
+		_, _ = w.Write(b)
+		return
+	}
+	if strings.TrimSpace(r.text) == "" {
+		// exit 0 但零输出：此前伪造成 200 incomplete 空包，下游空渲染；
+		// 现显式 502（与直播 shim_empty 对齐）。
+		logf("[SHIM %s] EMPTY ms=%d promptBytes=%d in=%d ses=%s cont=%s ua=%q", reqID, elms, len(prompt), r.usage.input, ses, cont, downUA)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadGateway)
+		b, _ := json.Marshal(map[string]any{"error": map[string]any{"type": "shim_empty", "message": "opencode exited 0 with no text output"}})
 		_, _ = w.Write(b)
 		return
 	}
@@ -751,7 +829,17 @@ func shimHandler(w http.ResponseWriter, req *http.Request) {
 // shimEmitStream 按规范序列吐流（单测与回放用；线上流式走 shimStreamLive 直播）。
 func shimEmitStream(w http.ResponseWriter, reqID, model string, env map[string]any, usage shimUsage) {
 	sink := newSSESink(w)
-	createdAt, _ := env["created_at"].(int64)
+	var createdAt int64
+	switch v := env["created_at"].(type) {
+	case int64:
+		createdAt = v
+	case float64:
+		createdAt = int64(v)
+	case int:
+		createdAt = int64(v)
+	default:
+		createdAt = time.Now().Unix()
+	}
 	msgID := fmt.Sprintf("msg_shim_%d", createdAt)
 	text := ""
 	if out, ok := env["output"].([]any); ok && len(out) > 0 {

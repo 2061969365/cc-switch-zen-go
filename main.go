@@ -476,8 +476,13 @@ func convHandlerInner(w http.ResponseWriter, req *http.Request, inner string, ze
 			normalizeReasoningEffort(upReqRetry)
 			if upBodyRetry, merr := json.Marshal(upReqRetry); merr == nil {
 				if r2, rerr := doUpstream(upBodyRetry); rerr == nil {
+					// 旧 AfterFunc 闭包持有 resp 变量，与本行写 resp 构成 data race；
+					// 先停旧的，再给新 body 注册新的（Body.Close 多次调用安全）。
+					stopUpstream()
 					resp = r2
 					defer resp.Body.Close()
+					stopUpstream = context.AfterFunc(req.Context(), func() { r2.Body.Close() })
+					defer stopUpstream()
 					tUp = time.Now()
 					upStatus = resp.StatusCode
 					allowedReasoningIDs = nil
