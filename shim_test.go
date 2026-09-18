@@ -237,7 +237,7 @@ func TestShimCmdArgsAlwaysStdin(t *testing.T) {
  "long": strings.Repeat("ab", 20000),
  }
  for name, p := range prompts {
- args, stdin := shimCmdArgs(p, "", "test/m")
+	args, stdin := shimCmdArgs(p, "", "test/m", "high")
  if stdin == nil {
  t.Fatalf("%s: stdin must never be nil", name)
  }
@@ -355,4 +355,85 @@ func TestShimStoreTouch(t *testing.T) {
  shimSes = map[string]*shimSesEntry{}
  shimSesQ = nil
  shimSesMu.Unlock()
+}
+
+// Concurrency defaults to 10, env overrides within 1..32.
+func TestShimConcurrencyDefault(t *testing.T) {
+ os.Unsetenv("SHIM_CONCURRENCY")
+ if got := shimConcurrency(); got != 10 {
+ t.Fatalf("default concurrency should be 10, got %d", got)
+ }
+ t.Setenv("SHIM_CONCURRENCY", "3")
+ if got := shimConcurrency(); got != 3 {
+ t.Fatalf("env override failed, got %d", got)
+ }
+ t.Setenv("SHIM_CONCURRENCY", "99")
+ if got := shimConcurrency(); got != 10 {
+ t.Fatalf("out-of-range must fall back to 10, got %d", got)
+ }
+ if cap(shimSem) != 10 {
+ t.Fatalf("semaphore capacity should be 10, got %d", cap(shimSem))
+ }
+}
+
+// Effort mapping: off omits, minimal kept, max->high, missing->high, illegal->high.
+func TestShimEffortVariant(t *testing.T) {
+ cases := map[string]string{
+ "": "high", "off": "", "minimal": "minimal", "low": "low",
+ "medium": "medium", "high": "high", "xhigh": "xhigh",
+ "max": "high", "bogus": "high", "OFF": "",
+ }
+ for in, want := range cases {
+ body := map[string]any{"reasoning": map[string]any{"effort": in}}
+ if got := shimEffortVariant(body); got != want {
+ t.Errorf("effort %q: got %q want %q", in, got, want)
+ }
+ }
+ if got := shimEffortVariant(map[string]any{}); got != "high" {
+ t.Errorf("missing reasoning should default high, got %q", got)
+ }
+}
+
+// Variant flag position: present when set, absent when off; prompt stays in stdin.
+func TestShimCmdArgsVariant(t *testing.T) {
+ args, _ := shimCmdArgs("hi", "", "test/m", "low")
+ found := false
+ for i, a := range args {
+ if a == "--variant" && i+1 < len(args) && args[i+1] == "low" {
+ found = true
+ }
+ if a == "hi" {
+ t.Fatalf("prompt leaked into argv")
+ }
+ }
+ if !found {
+ t.Fatalf("--variant low missing in %q", args)
+ }
+ args2, _ := shimCmdArgs("hi", "", "test/m", "")
+ for _, a := range args2 {
+ if a == "--variant" {
+ t.Fatalf("--variant must be omitted when empty")
+ }
+ }
+}
+
+// Non-stream parser ignores reasoning events: text/usage/session intact.
+func TestShimParseIgnoresReasoning(t *testing.T) {
+ var buf strings.Builder
+ for _, line := range []string{
+ `{"type":"step_start","sessionID":"ses_x"}`,
+ `{"type":"reasoning","sessionID":"ses_x","part":{"type":"reasoning","text":"think-one"}}`,
+ `{"type":"text","sessionID":"ses_x","part":{"type":"text","text":"answer"}}`,
+ `{"type":"reasoning","sessionID":"ses_x","part":{"type":"reasoning","text":"think-two"}}`,
+ `{"type":"step_finish","sessionID":"ses_x","part":{"tokens":{"total":10,"input":8,"output":2}}}`,
+ } {
+ buf.WriteString(line + "\n")
+ }
+ text, ses, usage := shimParseEvents(buf.String())
+ if text != "answer" {
+ t.Fatalf("text polluted by reasoning: %q", text)
+ }
+ if ses != "ses_x" || usage.total != 10 {
+ t.Fatalf("session/usage lost: %q %+v", ses, usage)
+ }
 }
