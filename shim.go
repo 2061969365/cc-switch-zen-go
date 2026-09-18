@@ -14,6 +14,8 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -226,30 +228,53 @@ func shimLastUserText(body map[string]any) string {
 
 var (
 	shimSesMu sync.Mutex
-	shimSes   = map[string]string{}
+	shimSes   = map[string]*shimSesEntry{}
 	shimSesQ  []string
 )
 
-func shimFingerprint(body map[string]any) string {
+type shimSesEntry struct {
+	sessionID string
+	lastSeen  time.Time
+}
+
+// shimSessionKey 会话键：x-session-id 头优先（harness 每窗口唯一，pi-ai 必带）；
+// 无头回退全文 hash（首条 input 全量 + instructions 全量 sha256，不截断）。
+// 旧的前 200/100 截断指纹必碰撞（harness 各窗口 system prompt 相同），已废弃。
+func shimSessionKey(h http.Header, body map[string]any) string {
+	if sid := strings.TrimSpace(h.Get("X-Session-Id")); sid != "" {
+		return "hdr:" + sid
+	}
 	first := ""
 	if items, ok := body["input"].([]any); ok && len(items) > 0 {
 		b, _ := json.Marshal(items[0])
 		first = string(b)
-		if len(first) > 200 {
-			first = first[:200]
-		}
 	}
 	ins, _ := body["instructions"].(string)
-	if len(ins) > 100 {
-		ins = ins[:100]
-	}
-	return first + "|" + ins
+	sum := sha256.Sum256([]byte(first + "\x00" + ins))
+	return "fp:" + hex.EncodeToString(sum[:])
+}
+
+// shimFingerprint 保留作兼容（单测/旧调用），转发到全文 hash。
+func shimFingerprint(body map[string]any) string {
+	return shimSessionKey(http.Header{}, body)
 }
 
 func shimLookupSession(fp string) string {
 	shimSesMu.Lock()
 	defer shimSesMu.Unlock()
-	return shimSes[fp]
+	if e, ok := shimSes[fp]; ok {
+		// LRU：命中 touch。
+		e.lastSeen = time.Now()
+		for i, k := range shimSesQ {
+			if k == fp {
+				shimSesQ = append(shimSesQ[:i], shimSesQ[i+1:]...)
+				break
+			}
+		}
+		shimSesQ = append(shimSesQ, fp)
+		return e.sessionID
+	}
+	return ""
 }
 
 func shimStoreSession(fp, ses string) {
@@ -258,14 +283,17 @@ func shimStoreSession(fp, ses string) {
 	}
 	shimSesMu.Lock()
 	defer shimSesMu.Unlock()
-	if _, ok := shimSes[fp]; !ok {
-		shimSesQ = append(shimSesQ, fp)
-		if len(shimSesQ) > 64 {
-			delete(shimSes, shimSesQ[0])
-			shimSesQ = shimSesQ[1:]
-		}
+	if e, ok := shimSes[fp]; ok {
+		e.sessionID = ses
+		e.lastSeen = time.Now()
+		return
 	}
-	shimSes[fp] = ses
+	shimSes[fp] = &shimSesEntry{sessionID: ses, lastSeen: time.Now()}
+	shimSesQ = append(shimSesQ, fp)
+	if len(shimSesQ) > 64 {
+		delete(shimSes, shimSesQ[0])
+		shimSesQ = shimSesQ[1:]
+	}
 }
 
 // ---------- 回吐清洗与 envelope（移植 sanitizeForJson/responsesEnvelope） ----------
@@ -637,9 +665,9 @@ func shimHandler(w http.ResponseWriter, req *http.Request) {
 		// opencode run -m 要求 provider/ 前缀，无则补 test/（已实测无前缀 exit 1）。
 		model = "test/" + model
 	}
-	// 会话钉定：同对话续 -s，只发增量；新对话拼全量。
-	// 无提示词注入：harness 的 instructions/input/tools 原样转文本，不附加任何附录。
-	fp := shimFingerprint(in)
+	// 会话钉定：x-session-id 头优先，同对话续 -s 只发增量；新对话拼全量。
+	// 无提示词注入：harness 的 instructions/input 原样转文本，不附加任何附录。
+	fp := shimSessionKey(req.Header, in)
 	ses := shimLookupSession(fp)
 	var prompt string
 	if ses != "" {
