@@ -4,6 +4,7 @@ package main
 import (
 	"encoding/json"
 	"io"
+	"net/http"
 	"net/http/httptest"
 	"os"
 	"strings"
@@ -250,4 +251,60 @@ func TestShimCmdArgsAlwaysStdin(t *testing.T) {
  }
  }
  }
+}
+
+// Header session wins: same body + different x-session-id => different keys;
+// same header + different body => same key (conversation identity, not content).
+func TestShimSessionKeyHeader(t *testing.T) {
+ body := map[string]any{"instructions": "sys", "input": []any{map[string]any{"role": "user", "content": "hi"}}}
+ h1 := http.Header{"X-Session-Id": []string{"ses-win-A"}}
+ h2 := http.Header{"X-Session-Id": []string{"ses-win-B"}}
+ k1 := shimSessionKey(h1, body)
+ k2 := shimSessionKey(h2, body)
+ if k1 == k2 {
+ t.Fatalf("different windows must not share a key: %q", k1)
+ }
+ other := map[string]any{"instructions": "sys2", "input": []any{map[string]any{"role": "user", "content": "other"}}}
+ if k3 := shimSessionKey(h1, other); k3 != k1 {
+ t.Fatalf("same window must keep its key: %q vs %q", k3, k1)
+ }
+}
+
+// Old truncation bug: same 200-byte prefix + same 100-byte instructions
+// prefix must NOT collide anymore (full hash).
+func TestShimSessionKeyNoPrefixCollision(t *testing.T) {
+ ins := strings.Repeat("s", 100) + "-TAIL-A"
+ ins2 := strings.Repeat("s", 100) + "-TAIL-B"
+ mk := func(first, instructions string) map[string]any {
+ return map[string]any{"instructions": instructions,
+ "input": []any{map[string]any{"role": "user", "content": first}}}
+ }
+ a := mk(strings.Repeat("x", 200)+"-A", ins)
+ b := mk(strings.Repeat("x", 200)+"-A", ins2)
+ if shimSessionKey(http.Header{}, a) == shimSessionKey(http.Header{}, b) {
+ t.Fatalf("same-prefix bodies must diverge under full hash")
+ }
+}
+
+// LRU: hit touches, eviction drops the least-recently-used.
+func TestShimSessionLRU(t *testing.T) {
+ shimSesMu.Lock()
+ shimSes = map[string]*shimSesEntry{}
+ shimSesQ = nil
+ shimSesMu.Unlock()
+ for i := 0; i < 64; i++ {
+ shimStoreSession("k-"+string(rune('a'+i%26))+string(rune('0'+i/26)), "ses")
+ }
+ shimLookupSession("k-a0")
+ shimStoreSession("k-new", "ses-new")
+ if got := shimLookupSession("k-a0"); got == "" {
+ t.Fatalf("recently used key must survive eviction")
+ }
+ if got := shimLookupSession("k-b0"); got != "" {
+ t.Fatalf("least-recently-used key must be evicted, got %q", got)
+ }
+ shimSesMu.Lock()
+ shimSes = map[string]*shimSesEntry{}
+ shimSesQ = nil
+ shimSesMu.Unlock()
 }
