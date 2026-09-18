@@ -224,6 +224,45 @@ func shimLastUserText(body map[string]any) string {
 	return ""
 }
 
+// shimReasoningSummaries：抽取回放回来的 reasoning item 中的可见 summary 文本。
+// reasoning item 无 role、带 summary 数组（网关自签发的 rs_shim_*，只有可见文本，
+// 永不含 encrypted_content）；只用于新会话回退拼 previous thinking。
+func shimReasoningSummaries(body map[string]any) []string {
+	items, _ := body["input"].([]any)
+	var out []string
+	for _, raw := range items {
+		it, ok := raw.(map[string]any)
+		if !ok || it["type"] != "reasoning" {
+			continue
+		}
+		sum, _ := it["summary"].([]any)
+		for _, s := range sum {
+			sm, ok := s.(map[string]any)
+			if !ok {
+				continue
+			}
+			if txt, ok := sm["text"].(string); ok && strings.TrimSpace(txt) != "" {
+				out = append(out, shimSanitize(txt, 4000))
+			}
+		}
+	}
+	return out
+}
+
+// shimSelectPrompt：新/续会话 prompt 选择。续会话只发增量（-s 服务端已有完整
+// reasoning，重发多余）；新会话拼全量，并在尾部追加回来的 previous thinking
+// 可见文本（标注来源，加密态永不重建）。
+func shimSelectPrompt(ses string, in map[string]any) string {
+	if ses != "" {
+		return shimLastUserText(in)
+	}
+	prompt := shimInputToPrompt(in)
+	if priors := shimReasoningSummaries(in); len(priors) > 0 {
+		prompt += "\n\n[previous thinking]\n" + strings.Join(priors, "\n\n")
+	}
+	return prompt
+}
+
 // ---------- 会话钉定（移植 convFingerprint/convSessions，64 上限） ----------
 
 var (
@@ -304,6 +343,29 @@ func shimStoreSession(fp, ses string) {
 	}
 }
 
+// shimEvictSession：驱逐死会话映射（-s 报 Session not found 后调用）。
+// 下次同 fp 回到新会话全量重发，不再沿用死 ID。
+func shimEvictSession(fp string) {
+	if fp == "" {
+		return
+	}
+	shimSesMu.Lock()
+	defer shimSesMu.Unlock()
+	delete(shimSes, fp)
+	for i, k := range shimSesQ {
+		if k == fp {
+			shimSesQ = append(shimSesQ[:i], shimSesQ[i+1:]...)
+			break
+		}
+	}
+}
+
+// shimIsSessionNotFound：识别 opencode run -s 死会话硬报错
+// （run.ts: session() 取不到即 "Session not found" + exit 1）。
+func shimIsSessionNotFound(errMsg string) bool {
+	return strings.Contains(errMsg, "Session not found")
+}
+
 // ---------- 回吐清洗与 envelope（移植 sanitizeForJson/responsesEnvelope） ----------
 
 // 去 ANSI 转义/裸控制字符（炸 envelope 的真凶），截断。
@@ -353,9 +415,22 @@ func shimSanitize(s string, maxLen int) string {
 }
 
 // 纯 message 回吐：身份归 harness 侧，shim 原文透传，不过问内容。
-func shimEnvelope(reqID, model, text string, usage shimUsage) map[string]any {
+// reasoning 在前、message 在后（与流式 completed.output 顺序一致）。
+func shimEnvelope(reqID, model, text string, usage shimUsage, reasoning []string) map[string]any {
 	now := time.Now().Unix()
 	output := []any{}
+	var n int64
+	for _, rt := range reasoning {
+		if strings.TrimSpace(rt) == "" {
+			continue
+		}
+		n++
+		output = append(output, map[string]any{
+			"id":   fmt.Sprintf("rs_shim_%d_%d", now, n),
+			"type": "reasoning",
+			"summary": []any{map[string]any{"type": "summary_text", "text": rt}},
+		})
+	}
 	if clean := shimSanitize(text, 24000); clean != "" {
 		output = append(output, map[string]any{
 			"id":   fmt.Sprintf("msg_shim_%d", now),
@@ -383,6 +458,7 @@ type shimResult struct {
 	sessionID string
 	errMsg    string
 	usage     shimUsage
+	reasoning []string
 }
 
 // shimUsage 真实 token 消耗（取自 --format json 的 step_finish.part.tokens）。
@@ -414,11 +490,12 @@ func shimUsageOf(ev map[string]any) shimUsage {
 	return u
 }
 
-// --format json 事件流：只取 text part + 顶层 sessionID（tool 事件不在 stdout，在 DB）。
+// --format json 事件流：取 text/reasoning part + 顶层 sessionID（tool 事件不在 stdout，在 DB）。
 // step_finish 顺带抽 usage。
-func shimParseEvents(out string) (string, string, shimUsage) {
+func shimParseEvents(out string) (string, string, shimUsage, []string) {
 	var texts []string
 	var usage shimUsage
+	var reasoning []string
 	sessionID := ""
 	for _, line := range strings.Split(out, "\n") {
 		t := strings.TrimSpace(line)
@@ -439,13 +516,19 @@ func shimParseEvents(out string) (string, string, shimUsage) {
 					texts = append(texts, txt)
 				}
 			}
+		case "reasoning":
+			if part, ok := ev["part"].(map[string]any); ok {
+				if txt, ok := part["text"].(string); ok && strings.TrimSpace(txt) != "" {
+					reasoning = append(reasoning, shimSanitize(txt, 1<<30))
+				}
+			}
 		case "step_finish":
 			if u := shimUsageOf(ev); u.total > 0 {
 				usage = u
 			}
 		}
 	}
-	return strings.Join(texts, ""), sessionID, usage
+	return strings.Join(texts, ""), sessionID, usage, reasoning
 }
 
 // shimEffortVariant: harness reasoning.effort → opencode --variant。
@@ -505,8 +588,8 @@ func shimRunOpencode(ctx context.Context, prompt, sessionID, model, variant stri
 		}
 		return shimResult{errMsg: msg}
 	}
-	text, ses, usage := shimParseEvents(outBuf.String())
-	return shimResult{ok: true, text: text, sessionID: ses, usage: usage}
+	text, ses, usage, reasoning := shimParseEvents(outBuf.String())
+	return shimResult{ok: true, text: text, sessionID: ses, usage: usage, reasoning: reasoning}
 }
 
 type limitedWriter struct {
@@ -571,6 +654,25 @@ type shimLiveResult struct {
 	firstByteMs int64
 }
 
+// rsPending：已收齐的 reasoning part，added→delta→done 严格有序后暂存，
+// 终态时补 output_item.done 并收录进 completed.output。
+type rsPending struct {
+	idx  int
+	id   string
+	text string
+}
+
+// shimCompletedItems：completed.output 内容，reasoning 在前、message 在后
+// （与流事件发射顺序一致；缺席 reasoning 则 harness 下轮回放整块消失）。
+func shimCompletedItems(msgItem map[string]any, rs []rsPending) []any {
+	out := make([]any, 0, len(rs)+1)
+	for _, rp := range rs {
+		out = append(out, map[string]any{"id": rp.id, "type": "reasoning",
+			"summary": []any{map[string]any{"type": "summary_text", "text": rp.text}}})
+	}
+	return append(out, msgItem)
+}
+
 // shimStreamLive P0：边跑边转播。created/item.added 立即发（TTFB≈进程启动），
 // stdout 逐行解析，text 事件即发 delta；结束补 done/completed/DONE。
 // 失败发 response.failed（pi-ai 可解析）；下游断开由 ctx 干掉进程，停发。
@@ -606,11 +708,6 @@ func shimStreamLive(ctx context.Context, w http.ResponseWriter, reqID, model, va
 	var usage shimUsage
 	// reasoning 转译状态：每 part 独占递增 output_index，added→delta→done 严格有序。
 	rsIdx := 0
-	type rsPending struct {
-		idx  int
-		id   string
-		text string
-	}
 	var rsList []rsPending
 	sc := bufio.NewScanner(stdout)
 	sc.Buffer(make([]byte, 64<<10), 4<<20)
@@ -722,7 +819,7 @@ func shimStreamLive(ctx context.Context, w http.ResponseWriter, reqID, model, va
 	sink.emit(map[string]any{"type": "response.output_item.done", "output_index": 0, "item": doneItem})
 	sink.emit(map[string]any{"type": "response.completed",
 		"response": map[string]any{"id": reqID, "object": "response", "created_at": createdAt, "model": model,
-			"status": "completed", "output": []any{doneItem},
+			"status": "completed", "output": shimCompletedItems(doneItem, rsList),
 			"usage": map[string]any{"input_tokens": usage.input, "output_tokens": usage.output, "total_tokens": usage.total}}})
 	sink.done()
 	return r
@@ -797,12 +894,7 @@ func shimHandler(w http.ResponseWriter, req *http.Request) {
 	// 无提示词注入：harness 的 instructions/input 原样转文本，不附加任何附录。
 	fp := shimSessionKey(req.Header, in)
 	ses := shimLookupSession(fp)
-	var prompt string
-	if ses != "" {
-		prompt = shimLastUserText(in)
-	} else {
-		prompt = shimInputToPrompt(in)
-	}
+	prompt := shimSelectPrompt(ses, in)
 	if strings.TrimSpace(prompt) == "" {
 		shimWriteError(w, http.StatusBadRequest, "empty prompt")
 		return
@@ -836,6 +928,11 @@ func shimHandler(w http.ResponseWriter, req *http.Request) {
 		}
 		if !lr.ok {
 			logf("[SHIM %s] LIVE ERROR ms=%d firstByte=%dms promptBytes=%d ses=%s cont=%s model=%s ua=%q err=%.200s", reqID, elms, lr.firstByteMs, len(prompt), ses, cont, model, downUA, lr.errMsg)
+			if ses != "" && shimIsSessionNotFound(lr.errMsg) {
+				// 流式已写头无法同请求重试：驱逐映射，下轮自动回到新会话。
+				logf("[SHIM %s] session expired ses=%s, evicted", reqID, ses)
+				shimEvictSession(fp)
+			}
 			return
 		}
 		if lr.sessionID != "" {
@@ -846,6 +943,15 @@ func shimHandler(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 	r := shimRunOpencode(ctx, prompt, ses, model, variant)
+	if !r.ok && !r.timeout && ses != "" && shimIsSessionNotFound(r.errMsg) {
+		// -s 死会话：驱逐映射，按新会话（全量+previous thinking）同请求重试一次。
+		// 加密态丢失是物理定律，保可用不保记忆。
+		logf("[SHIM %s] session expired ses=%s, evict and retry as new", reqID, ses)
+		shimEvictSession(fp)
+		ses = ""
+		prompt = shimSelectPrompt("", in)
+		r = shimRunOpencode(ctx, prompt, "", model, variant)
+	}
 	elms := time.Since(t0).Milliseconds()
 	cont := "new"
 	if ses != "" {
@@ -880,7 +986,7 @@ func shimHandler(w http.ResponseWriter, req *http.Request) {
 	if r.sessionID != "" {
 		shimStoreSession(fp, r.sessionID)
 	}
-	env := shimEnvelope(reqID, model, r.text, r.usage)
+	env := shimEnvelope(reqID, model, r.text, r.usage, r.reasoning)
 	logf("[SHIM %s] done ok ms=%d promptBytes=%d textLen=%d in=%d out=%d ses=%s cont=%s model=%s ua=%q", reqID, elms, len(prompt), len(r.text), r.usage.input, r.usage.output, r.sessionID, cont, model, downUA)
 	w.Header().Set("Content-Type", "application/json")
 	b, _ := json.Marshal(env)

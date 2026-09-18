@@ -97,11 +97,11 @@ func TestShimFingerprint(t *testing.T) {
 
 // 空文本 → incomplete；有文本 → completed 且 output 结构对。
 func TestShimEnvelope(t *testing.T) {
-	e0 := shimEnvelope("resp_1", "m", "", shimUsage{})
+  e0 := shimEnvelope("resp_1", "m", "", shimUsage{}, nil)
 	if e0["status"] != "incomplete" {
 		t.Errorf("空文本应 incomplete：%v", e0["status"])
 	}
-	e1 := shimEnvelope("resp_2", "m", "hello", shimUsage{input: 10, output: 5, total: 15})
+  e1 := shimEnvelope("resp_2", "m", "hello", shimUsage{input: 10, output: 5, total: 15}, nil)
 	if e1["status"] != "completed" {
 		t.Errorf("有文本应 completed：%v", e1["status"])
 	}
@@ -157,7 +157,7 @@ func TestShimBypassRouting(t *testing.T) {	official := []string{
 // Delta chunks must reassemble to the original text.
 func TestShimEmitStreamSequence(t *testing.T) {
  longText := strings.Repeat("ab", 600) + "end"
- env := shimEnvelope("resp_seq1", "m", longText, shimUsage{})
+  env := shimEnvelope("resp_seq1", "m", longText, shimUsage{}, nil)
  rec := httptest.NewRecorder()
  shimEmitStream(rec, "resp_seq1", "m", env, shimUsage{})
  body := rec.Body.String()
@@ -429,11 +429,136 @@ func TestShimParseIgnoresReasoning(t *testing.T) {
  } {
  buf.WriteString(line + "\n")
  }
- text, ses, usage := shimParseEvents(buf.String())
- if text != "answer" {
- t.Fatalf("text polluted by reasoning: %q", text)
- }
- if ses != "ses_x" || usage.total != 10 {
- t.Fatalf("session/usage lost: %q %+v", ses, usage)
- }
+  text, ses, usage, _ := shimParseEvents(buf.String())
+  if text != "answer" {
+    t.Fatalf("text polluted by reasoning: %q", text)
+  }
+  if ses != "ses_x" || usage.total != 10 {
+    t.Fatalf("session/usage lost: %q %+v", ses, usage)
+  }
+}
+
+// Non-stream parser must surface reasoning texts alongside text/usage/session.
+func TestShimParseEventsReasoning(t *testing.T) {
+  out := "{\"type\":\"reasoning\",\"sessionID\":\"ses_r\",\"part\":{\"type\":\"reasoning\",\"text\":\"think-r\"}}\n" +
+    "{\"type\":\"text\",\"sessionID\":\"ses_r\",\"part\":{\"type\":\"text\",\"text\":\"ans\"}}\n"
+  text, ses, _, reasoning := shimParseEvents(out)
+  if text != "ans" || ses != "ses_r" {
+    t.Fatalf("text/session lost: %q %q", text, ses)
+  }
+  if len(reasoning) != 1 || reasoning[0] != "think-r" {
+    t.Fatalf("reasoning lost: %q", reasoning)
+  }
+}
+
+// Non-stream envelope carries reasoning items ahead of the message.
+func TestShimEnvelopeReasoning(t *testing.T) {
+  e := shimEnvelope("resp_r", "m", "hi", shimUsage{}, []string{"think-r"})
+  if e["status"] != "completed" {
+    t.Fatalf("status 错误：%v", e["status"])
+  }
+  out, _ := e["output"].([]any)
+  if len(out) != 2 {
+    t.Fatalf("output 项数错误：%d", len(out))
+  }
+  first, _ := out[0].(map[string]any)
+  if first["type"] != "reasoning" {
+    t.Fatalf("首项应为 reasoning：%v", out[0])
+  }
+}
+
+// Red line: encrypted_content must never appear in any gateway-emitted payload.
+func TestShimNoEncryptedContentLeak(t *testing.T) {
+  e := shimEnvelope("resp_l", "m", "hi", shimUsage{}, []string{"think-l"})
+  b, err := json.Marshal(e)
+  if err != nil {
+    t.Fatalf("Marshal 失败：%v", err)
+  }
+  if strings.Contains(string(b), "encrypted_content") {
+    t.Fatalf("envelope 泄漏 encrypted_content：%s", b)
+  }
+  out := shimCompletedItems(map[string]any{"id": "m", "type": "message"}, []rsPending{{idx: 1, id: "rs_1", text: "t"}})
+  b, _ = json.Marshal(out)
+  if strings.Contains(string(b), "encrypted_content") {
+    t.Fatalf("completed output 泄漏 encrypted_content：%s", b)
+  }
+}
+
+// -s 死会话识别：opencode run.ts 的 "Session not found" 硬报错必须被认出。
+func TestShimIsSessionNotFound(t *testing.T) {
+  if !shimIsSessionNotFound("exit status 1 | Session not found") {
+    t.Fatalf("Session not found 未识别")
+  }
+  if shimIsSessionNotFound("exit status 1 | boom") {
+    t.Fatalf("普通失败被误判为死会话")
+  }
+}
+
+// 驱逐后同一 fp 必须回到新会话（下次全量重发，不再沿用死 ID）。
+func TestShimEvictSession(t *testing.T) {
+  fp := "fp-evict-test"
+  shimStoreSession(fp, "ses_dead")
+  if got := shimLookupSession(fp); got != "ses_dead" {
+    t.Fatalf("前置存入失败：%q", got)
+  }
+  shimEvictSession(fp)
+  if got := shimLookupSession(fp); got != "" {
+    t.Fatalf("驱逐后仍命中死会话：%q", got)
+  }
+}
+
+// Replayed reasoning items (no role, summary array) must be extractable as
+// visible prior-thinking text for new-session fallback.
+func TestShimReasoningSummaries(t *testing.T) {
+  body := map[string]any{"input": []any{
+    map[string]any{"type": "reasoning", "id": "rs_shim_1_1",
+      "summary": []any{map[string]any{"type": "summary_text", "text": "prior thought"}}},
+    map[string]any{"role": "user", "content": "next?"},
+  }}
+  got := shimReasoningSummaries(body)
+  if len(got) != 1 || got[0] != "prior thought" {
+    t.Fatalf("reasoning summary 丢失：%q", got)
+  }
+}
+
+// 新会话回退必须带上回来的 previous thinking；续会话走增量，不带。
+func TestShimSelectPrompt(t *testing.T) {
+  body := map[string]any{
+    "instructions": "sys",
+    "input": []any{
+      map[string]any{"role": "user", "content": "first?"},
+      map[string]any{"type": "reasoning", "id": "rs_shim_9_1",
+        "summary": []any{map[string]any{"type": "summary_text", "text": "prior thought"}}},
+      map[string]any{"role": "user", "content": "second?"},
+    },
+  }
+  pNew := shimSelectPrompt("", body)
+  if !strings.Contains(pNew, "prior thought") || !strings.Contains(pNew, "[previous thinking]") {
+    t.Fatalf("新会话丢了 previous thinking：%q", pNew)
+  }
+  pCont := shimSelectPrompt("ses_old", body)
+  if strings.Contains(pCont, "prior thought") || strings.Contains(pCont, "[previous thinking]") {
+    t.Fatalf("续会话不应重发旧 thinking：%q", pCont)
+  }
+  if pCont != "second?" {
+    t.Fatalf("续会话增量取错：%q", pCont)
+  }
+}
+
+// completed.output 必须收录 reasoning items（缺席则 harness 下轮回放整块消失）。
+func TestShimCompletedIncludesReasoning(t *testing.T) {
+  msg := map[string]any{"id": "msg_x", "type": "message"}
+  rs := []rsPending{{idx: 1, id: "rs_shim_1_1", text: "thought"}}
+  out := shimCompletedItems(msg, rs)
+  if len(out) != 2 {
+    t.Fatalf("output 项数错误：%d", len(out))
+  }
+  first, _ := out[0].(map[string]any)
+  if first["type"] != "reasoning" || first["id"] != "rs_shim_1_1" {
+    t.Fatalf("首项应为 reasoning：%v", out[0])
+  }
+  sum, _ := first["summary"].([]any)
+  if len(sum) != 1 {
+    t.Fatalf("reasoning 缺 summary：%v", first)
+  }
 }
