@@ -433,7 +433,21 @@ func TestShimParseIgnoresReasoning(t *testing.T) {
  if text != "answer" {
  t.Fatalf("text polluted by reasoning: %q", text)
  }
- if ses != "ses_x" || usage.total != 10 {
- t.Fatalf("session/usage lost: %q %+v", ses, usage)
- }
+  if ses != "ses_x" || usage.total != 10 {
+  t.Fatalf("session/usage lost: %q %+v", ses, usage)
+  }
+}
+
+// Replayed reasoning items (no role, summary array) must be extractable as
+// visible prior-thinking text for new-session fallback.
+func TestShimReasoningSummaries(t *testing.T) {
+  body := map[string]any{"input": []any{
+    map[string]any{"type": "reasoning", "id": "rs_shim_1_1",
+      "summary": []any{map[string]any{"type": "summary_text", "text": "prior thought"}}},
+    map[string]any{"role": "user", "content": "next?"},
+  }}
+  got := shimReasoningSummaries(body)
+  if len(got) != 1 || got[0] != "prior thought" {
+    t.Fatalf("reasoning summary 丢失：%q", got)
+  }
 }

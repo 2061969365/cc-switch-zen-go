@@ -224,6 +224,31 @@ func shimLastUserText(body map[string]any) string {
 	return ""
 }
 
+// shimReasoningSummaries：抽取回放回来的 reasoning item 中的可见 summary 文本。
+// reasoning item 无 role、带 summary 数组（网关自签发的 rs_shim_*，只有可见文本，
+// 永不含 encrypted_content）；只用于新会话回退拼 previous thinking。
+func shimReasoningSummaries(body map[string]any) []string {
+	items, _ := body["input"].([]any)
+	var out []string
+	for _, raw := range items {
+		it, ok := raw.(map[string]any)
+		if !ok || it["type"] != "reasoning" {
+			continue
+		}
+		sum, _ := it["summary"].([]any)
+		for _, s := range sum {
+			sm, ok := s.(map[string]any)
+			if !ok {
+				continue
+			}
+			if txt, ok := sm["text"].(string); ok && strings.TrimSpace(txt) != "" {
+				out = append(out, shimSanitize(txt, 4000))
+			}
+		}
+	}
+	return out
+}
+
 // ---------- 会话钉定（移植 convFingerprint/convSessions，64 上限） ----------
 
 var (
