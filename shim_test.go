@@ -475,3 +475,21 @@ func TestShimSelectPrompt(t *testing.T) {
     t.Fatalf("续会话增量取错：%q", pCont)
   }
 }
+
+// completed.output 必须收录 reasoning items（缺席则 harness 下轮回放整块消失）。
+func TestShimCompletedIncludesReasoning(t *testing.T) {
+  msg := map[string]any{"id": "msg_x", "type": "message"}
+  rs := []rsPending{{idx: 1, id: "rs_shim_1_1", text: "thought"}}
+  out := shimCompletedItems(msg, rs)
+  if len(out) != 2 {
+    t.Fatalf("output 项数错误：%d", len(out))
+  }
+  first, _ := out[0].(map[string]any)
+  if first["type"] != "reasoning" || first["id"] != "rs_shim_1_1" {
+    t.Fatalf("首项应为 reasoning：%v", out[0])
+  }
+  sum, _ := first["summary"].([]any)
+  if len(sum) != 1 {
+    t.Fatalf("reasoning 缺 summary：%v", first)
+  }
+}

@@ -610,6 +610,25 @@ type shimLiveResult struct {
 	firstByteMs int64
 }
 
+// rsPending：已收齐的 reasoning part，added→delta→done 严格有序后暂存，
+// 终态时补 output_item.done 并收录进 completed.output。
+type rsPending struct {
+	idx  int
+	id   string
+	text string
+}
+
+// shimCompletedItems：completed.output 内容，reasoning 在前、message 在后
+// （与流事件发射顺序一致；缺席 reasoning 则 harness 下轮回放整块消失）。
+func shimCompletedItems(msgItem map[string]any, rs []rsPending) []any {
+	out := make([]any, 0, len(rs)+1)
+	for _, rp := range rs {
+		out = append(out, map[string]any{"id": rp.id, "type": "reasoning",
+			"summary": []any{map[string]any{"type": "summary_text", "text": rp.text}}})
+	}
+	return append(out, msgItem)
+}
+
 // shimStreamLive P0：边跑边转播。created/item.added 立即发（TTFB≈进程启动），
 // stdout 逐行解析，text 事件即发 delta；结束补 done/completed/DONE。
 // 失败发 response.failed（pi-ai 可解析）；下游断开由 ctx 干掉进程，停发。
@@ -645,11 +664,6 @@ func shimStreamLive(ctx context.Context, w http.ResponseWriter, reqID, model, va
 	var usage shimUsage
 	// reasoning 转译状态：每 part 独占递增 output_index，added→delta→done 严格有序。
 	rsIdx := 0
-	type rsPending struct {
-		idx  int
-		id   string
-		text string
-	}
 	var rsList []rsPending
 	sc := bufio.NewScanner(stdout)
 	sc.Buffer(make([]byte, 64<<10), 4<<20)
@@ -761,7 +775,7 @@ func shimStreamLive(ctx context.Context, w http.ResponseWriter, reqID, model, va
 	sink.emit(map[string]any{"type": "response.output_item.done", "output_index": 0, "item": doneItem})
 	sink.emit(map[string]any{"type": "response.completed",
 		"response": map[string]any{"id": reqID, "object": "response", "created_at": createdAt, "model": model,
-			"status": "completed", "output": []any{doneItem},
+			"status": "completed", "output": shimCompletedItems(doneItem, rsList),
 			"usage": map[string]any{"input_tokens": usage.input, "output_tokens": usage.output, "total_tokens": usage.total}}})
 	sink.done()
 	return r
