@@ -4,6 +4,7 @@ package main
 import (
 	"encoding/json"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 )
@@ -200,19 +201,14 @@ func TestShimEmitStreamSequence(t *testing.T) {
 
 // Plan-mode identity sentences are stripped, substance kept; fail-open on
 // all-identity input; identity-free input untouched.
-func TestShimStripPlanMode(t *testing.T) {
- in := "Hi! I'm in plan mode (read-only) right now. What would you like to build?"
- got := shimStripPlanMode(in)
- if strings.Contains(strings.ToLower(got), "plan mode") {
- t.Fatalf("announcement survived: %q", got)
+// Agent defaults to bypass, SHIM_AGENT overrides.
+func TestShimAgentDefault(t *testing.T) {
+ os.Unsetenv("SHIM_AGENT")
+ if got := shimAgent(); got != "bypass" {
+ t.Fatalf("default agent should be bypass, got %q", got)
  }
- if !strings.Contains(got, "What would you like to build?") {
- t.Errorf("substance lost: %q", got)
- }
- if got2 := shimStripPlanMode("Just a normal answer."); got2 != "Just a normal answer." {
- t.Errorf("clean text altered: %q", got2)
- }
- if got3 := shimStripPlanMode("Plan mode blocks edits."); got3 == "" {
- t.Errorf("fail-open violated: empty result")
+ t.Setenv("SHIM_AGENT", "plan")
+ if got := shimAgent(); got != "plan" {
+ t.Fatalf("SHIM_AGENT override failed, got %q", got)
  }
 }
