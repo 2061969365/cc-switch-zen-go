@@ -3,6 +3,7 @@ package main
 
 import (
 	"encoding/json"
+	"net/http/httptest"
 	"strings"
 	"testing"
 )
@@ -146,4 +147,53 @@ func TestShimBypassRouting(t *testing.T) {	official := []string{
 			t.Errorf("外来 UA 被判老链路：%q", ua)
 		}
 	}
+}
+
+// Stream sequence must follow the canonical responses order so pi-ai can
+// parse it: created -> item.added -> delta* -> item.done -> completed -> DONE.
+// Delta chunks must reassemble to the original text.
+func TestShimEmitStreamSequence(t *testing.T) {
+ longText := strings.Repeat("ab", 600) + "end"
+ env := shimEnvelope("resp_seq1", "m", longText)
+ rec := httptest.NewRecorder()
+ shimEmitStream(rec, "resp_seq1", "m", env)
+ body := rec.Body.String()
+ if !strings.Contains(body, "data: [DONE]") {
+ t.Fatalf("missing [DONE] tail")
+ }
+ order := []string{"response.created", "response.output_item.added", "response.output_text.delta", "response.output_item.done", "response.completed"}
+ last := -1
+ for _, ev := range order {
+ pos := strings.Index(body, ev)
+ if pos < 0 {
+ t.Fatalf("missing event %s", ev)
+ }
+ if pos < last {
+ t.Fatalf("event out of order: %s", ev)
+ }
+ last = pos
+ }
+ var rebuilt strings.Builder
+ for _, line := range strings.Split(body, "\n") {
+ line = strings.TrimSpace(line)
+ if !strings.HasPrefix(line, "data: ") {
+ continue
+ }
+ payload := strings.TrimPrefix(line, "data: ")
+ if payload == "[DONE]" {
+ continue
+ }
+ var m map[string]any
+ if err := json.Unmarshal([]byte(payload), &m); err != nil {
+ t.Fatalf("event not json: %v", err)
+ }
+ if m["type"] == "response.output_text.delta" {
+ if d, ok := m["delta"].(string); ok {
+ rebuilt.WriteString(d)
+ }
+ }
+ }
+ if rebuilt.String() != longText {
+ t.Fatalf("delta reassembly mismatch: got %d runes, want %d", len([]rune(rebuilt.String())), len([]rune(longText)))
+ }
 }
