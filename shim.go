@@ -555,15 +555,58 @@ func shimHandler(w http.ResponseWriter, req *http.Request) {
 	env := shimEnvelope(reqID, model, r.text)
 	logf("[SHIM %s] done ok ms=%d textLen=%d ses=%s cont=%s ua=%q", reqID, elms, len(r.text), r.sessionID, cont, downUA)
 	if stream {
-		// 一次性 SSE（Node 版已验证 pi-ai 可解析）：in_progress 空壳 + completed + DONE。
-		sink := newSSESink(w)
-		inProg := map[string]any{"id": reqID, "object": "response", "created_at": env["created_at"], "model": model, "status": "in_progress", "output": []any{}}
-		sink.emit(inProg)
-		sink.emit(env)
-		sink.done()
+		// 规范 responses 流式事件序列（pi-ai 只认这套：output_item.added 建槽，
+		// delta 累文本，output_item.done 落槽，completed 结算；整包 output 会被无视，
+		// 缺槽的 delta 直接丢弃——此前自造三件套导致 harness 解析出空）。
+		shimEmitStream(w, reqID, model, env)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
 	b, _ := json.Marshal(env)
 	_, _ = w.Write(b)
+}
+
+// shimEmitStream 按规范序列吐流：created → item.added → text.delta* →
+// item.done → completed → [DONE]。文本按 500 字切块，有流式感。
+func shimEmitStream(w http.ResponseWriter, reqID, model string, env map[string]any) {
+	sink := newSSESink(w)
+	createdAt, _ := env["created_at"].(int64)
+	msgID := fmt.Sprintf("msg_shim_%d", createdAt)
+	text := ""
+	if out, ok := env["output"].([]any); ok && len(out) > 0 {
+		if msg, ok := out[0].(map[string]any); ok {
+			if content, ok := msg["content"].([]any); ok && len(content) > 0 {
+				if c0, ok := content[0].(map[string]any); ok {
+					text, _ = c0["text"].(string)
+				}
+			}
+		}
+	}
+	// 1. response.created
+	sink.emit(map[string]any{"type": "response.created",
+		"response": map[string]any{"id": reqID, "object": "response", "created_at": createdAt, "model": model, "status": "in_progress", "output": []any{}}})
+	// 2. output_item.added 建槽
+	msgItem := map[string]any{"id": msgID, "type": "message", "role": "assistant",
+		"content": []any{map[string]any{"type": "output_text", "text": "", "annotations": []any{}}}}
+	sink.emit(map[string]any{"type": "response.output_item.added", "output_index": 0, "item": msgItem})
+	// 3. delta 切块（按 rune 切，防中文半字）
+	runes := []rune(text)
+	for i := 0; i < len(runes); i += 500 {
+		end := i + 500
+		if end > len(runes) {
+			end = len(runes)
+		}
+		sink.emit(map[string]any{"type": "response.output_text.delta", "output_index": 0,
+			"item_id": msgID, "delta": string(runes[i:end])})
+	}
+	// 4. output_item.done 落槽（完整文本）
+	doneItem := map[string]any{"id": msgID, "type": "message", "role": "assistant",
+		"content": []any{map[string]any{"type": "output_text", "text": text, "annotations": []any{}}}}
+	sink.emit(map[string]any{"type": "response.output_item.done", "output_index": 0, "item": doneItem})
+	// 5. completed 结算
+	sink.emit(map[string]any{"type": "response.completed",
+		"response": map[string]any{"id": reqID, "object": "response", "created_at": createdAt, "model": model,
+			"status": "completed", "output": env["output"],
+			"usage": map[string]any{"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}}})
+	sink.done()
 }
