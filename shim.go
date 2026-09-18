@@ -249,6 +249,20 @@ func shimReasoningSummaries(body map[string]any) []string {
 	return out
 }
 
+// shimSelectPrompt：新/续会话 prompt 选择。续会话只发增量（-s 服务端已有完整
+// reasoning，重发多余）；新会话拼全量，并在尾部追加回来的 previous thinking
+// 可见文本（标注来源，加密态永不重建）。
+func shimSelectPrompt(ses string, in map[string]any) string {
+	if ses != "" {
+		return shimLastUserText(in)
+	}
+	prompt := shimInputToPrompt(in)
+	if priors := shimReasoningSummaries(in); len(priors) > 0 {
+		prompt += "\n\n[previous thinking]\n" + strings.Join(priors, "\n\n")
+	}
+	return prompt
+}
+
 // ---------- 会话钉定（移植 convFingerprint/convSessions，64 上限） ----------
 
 var (
@@ -822,12 +836,7 @@ func shimHandler(w http.ResponseWriter, req *http.Request) {
 	// 无提示词注入：harness 的 instructions/input 原样转文本，不附加任何附录。
 	fp := shimSessionKey(req.Header, in)
 	ses := shimLookupSession(fp)
-	var prompt string
-	if ses != "" {
-		prompt = shimLastUserText(in)
-	} else {
-		prompt = shimInputToPrompt(in)
-	}
+	prompt := shimSelectPrompt(ses, in)
 	if strings.TrimSpace(prompt) == "" {
 		shimWriteError(w, http.StatusBadRequest, "empty prompt")
 		return

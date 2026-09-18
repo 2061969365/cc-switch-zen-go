@@ -451,3 +451,27 @@ func TestShimReasoningSummaries(t *testing.T) {
     t.Fatalf("reasoning summary 丢失：%q", got)
   }
 }
+
+// 新会话回退必须带上回来的 previous thinking；续会话走增量，不带。
+func TestShimSelectPrompt(t *testing.T) {
+  body := map[string]any{
+    "instructions": "sys",
+    "input": []any{
+      map[string]any{"role": "user", "content": "first?"},
+      map[string]any{"type": "reasoning", "id": "rs_shim_9_1",
+        "summary": []any{map[string]any{"type": "summary_text", "text": "prior thought"}}},
+      map[string]any{"role": "user", "content": "second?"},
+    },
+  }
+  pNew := shimSelectPrompt("", body)
+  if !strings.Contains(pNew, "prior thought") || !strings.Contains(pNew, "[previous thinking]") {
+    t.Fatalf("新会话丢了 previous thinking：%q", pNew)
+  }
+  pCont := shimSelectPrompt("ses_old", body)
+  if strings.Contains(pCont, "prior thought") || strings.Contains(pCont, "[previous thinking]") {
+    t.Fatalf("续会话不应重发旧 thinking：%q", pCont)
+  }
+  if pCont != "second?" {
+    t.Fatalf("续会话增量取错：%q", pCont)
+  }
+}
