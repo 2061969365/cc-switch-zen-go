@@ -392,9 +392,22 @@ func shimSanitize(s string, maxLen int) string {
 }
 
 // 纯 message 回吐：身份归 harness 侧，shim 原文透传，不过问内容。
-func shimEnvelope(reqID, model, text string, usage shimUsage) map[string]any {
+// reasoning 在前、message 在后（与流式 completed.output 顺序一致）。
+func shimEnvelope(reqID, model, text string, usage shimUsage, reasoning []string) map[string]any {
 	now := time.Now().Unix()
 	output := []any{}
+	var n int64
+	for _, rt := range reasoning {
+		if strings.TrimSpace(rt) == "" {
+			continue
+		}
+		n++
+		output = append(output, map[string]any{
+			"id":   fmt.Sprintf("rs_shim_%d_%d", now, n),
+			"type": "reasoning",
+			"summary": []any{map[string]any{"type": "summary_text", "text": rt}},
+		})
+	}
 	if clean := shimSanitize(text, 24000); clean != "" {
 		output = append(output, map[string]any{
 			"id":   fmt.Sprintf("msg_shim_%d", now),
@@ -422,6 +435,7 @@ type shimResult struct {
 	sessionID string
 	errMsg    string
 	usage     shimUsage
+	reasoning []string
 }
 
 // shimUsage 真实 token 消耗（取自 --format json 的 step_finish.part.tokens）。
@@ -453,11 +467,12 @@ func shimUsageOf(ev map[string]any) shimUsage {
 	return u
 }
 
-// --format json 事件流：只取 text part + 顶层 sessionID（tool 事件不在 stdout，在 DB）。
+// --format json 事件流：取 text/reasoning part + 顶层 sessionID（tool 事件不在 stdout，在 DB）。
 // step_finish 顺带抽 usage。
-func shimParseEvents(out string) (string, string, shimUsage) {
+func shimParseEvents(out string) (string, string, shimUsage, []string) {
 	var texts []string
 	var usage shimUsage
+	var reasoning []string
 	sessionID := ""
 	for _, line := range strings.Split(out, "\n") {
 		t := strings.TrimSpace(line)
@@ -478,13 +493,19 @@ func shimParseEvents(out string) (string, string, shimUsage) {
 					texts = append(texts, txt)
 				}
 			}
+		case "reasoning":
+			if part, ok := ev["part"].(map[string]any); ok {
+				if txt, ok := part["text"].(string); ok && strings.TrimSpace(txt) != "" {
+					reasoning = append(reasoning, shimSanitize(txt, 1<<30))
+				}
+			}
 		case "step_finish":
 			if u := shimUsageOf(ev); u.total > 0 {
 				usage = u
 			}
 		}
 	}
-	return strings.Join(texts, ""), sessionID, usage
+	return strings.Join(texts, ""), sessionID, usage, reasoning
 }
 
 // shimEffortVariant: harness reasoning.effort → opencode --variant。
@@ -544,8 +565,8 @@ func shimRunOpencode(ctx context.Context, prompt, sessionID, model, variant stri
 		}
 		return shimResult{errMsg: msg}
 	}
-	text, ses, usage := shimParseEvents(outBuf.String())
-	return shimResult{ok: true, text: text, sessionID: ses, usage: usage}
+	text, ses, usage, reasoning := shimParseEvents(outBuf.String())
+	return shimResult{ok: true, text: text, sessionID: ses, usage: usage, reasoning: reasoning}
 }
 
 type limitedWriter struct {
@@ -928,7 +949,7 @@ func shimHandler(w http.ResponseWriter, req *http.Request) {
 	if r.sessionID != "" {
 		shimStoreSession(fp, r.sessionID)
 	}
-	env := shimEnvelope(reqID, model, r.text, r.usage)
+	env := shimEnvelope(reqID, model, r.text, r.usage, r.reasoning)
 	logf("[SHIM %s] done ok ms=%d promptBytes=%d textLen=%d in=%d out=%d ses=%s cont=%s model=%s ua=%q", reqID, elms, len(prompt), len(r.text), r.usage.input, r.usage.output, r.sessionID, cont, model, downUA)
 	w.Header().Set("Content-Type", "application/json")
 	b, _ := json.Marshal(env)

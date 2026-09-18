@@ -97,11 +97,11 @@ func TestShimFingerprint(t *testing.T) {
 
 // 空文本 → incomplete；有文本 → completed 且 output 结构对。
 func TestShimEnvelope(t *testing.T) {
-	e0 := shimEnvelope("resp_1", "m", "", shimUsage{})
+  e0 := shimEnvelope("resp_1", "m", "", shimUsage{}, nil)
 	if e0["status"] != "incomplete" {
 		t.Errorf("空文本应 incomplete：%v", e0["status"])
 	}
-	e1 := shimEnvelope("resp_2", "m", "hello", shimUsage{input: 10, output: 5, total: 15})
+  e1 := shimEnvelope("resp_2", "m", "hello", shimUsage{input: 10, output: 5, total: 15}, nil)
 	if e1["status"] != "completed" {
 		t.Errorf("有文本应 completed：%v", e1["status"])
 	}
@@ -157,7 +157,7 @@ func TestShimBypassRouting(t *testing.T) {	official := []string{
 // Delta chunks must reassemble to the original text.
 func TestShimEmitStreamSequence(t *testing.T) {
  longText := strings.Repeat("ab", 600) + "end"
- env := shimEnvelope("resp_seq1", "m", longText, shimUsage{})
+  env := shimEnvelope("resp_seq1", "m", longText, shimUsage{}, nil)
  rec := httptest.NewRecorder()
  shimEmitStream(rec, "resp_seq1", "m", env, shimUsage{})
  body := rec.Body.String()
@@ -429,12 +429,57 @@ func TestShimParseIgnoresReasoning(t *testing.T) {
  } {
  buf.WriteString(line + "\n")
  }
- text, ses, usage := shimParseEvents(buf.String())
- if text != "answer" {
- t.Fatalf("text polluted by reasoning: %q", text)
- }
+  text, ses, usage, _ := shimParseEvents(buf.String())
+  if text != "answer" {
+    t.Fatalf("text polluted by reasoning: %q", text)
+  }
   if ses != "ses_x" || usage.total != 10 {
-  t.Fatalf("session/usage lost: %q %+v", ses, usage)
+    t.Fatalf("session/usage lost: %q %+v", ses, usage)
+  }
+}
+
+// Non-stream parser must surface reasoning texts alongside text/usage/session.
+func TestShimParseEventsReasoning(t *testing.T) {
+  out := "{\"type\":\"reasoning\",\"sessionID\":\"ses_r\",\"part\":{\"type\":\"reasoning\",\"text\":\"think-r\"}}\n" +
+    "{\"type\":\"text\",\"sessionID\":\"ses_r\",\"part\":{\"type\":\"text\",\"text\":\"ans\"}}\n"
+  text, ses, _, reasoning := shimParseEvents(out)
+  if text != "ans" || ses != "ses_r" {
+    t.Fatalf("text/session lost: %q %q", text, ses)
+  }
+  if len(reasoning) != 1 || reasoning[0] != "think-r" {
+    t.Fatalf("reasoning lost: %q", reasoning)
+  }
+}
+
+// Non-stream envelope carries reasoning items ahead of the message.
+func TestShimEnvelopeReasoning(t *testing.T) {
+  e := shimEnvelope("resp_r", "m", "hi", shimUsage{}, []string{"think-r"})
+  if e["status"] != "completed" {
+    t.Fatalf("status 错误：%v", e["status"])
+  }
+  out, _ := e["output"].([]any)
+  if len(out) != 2 {
+    t.Fatalf("output 项数错误：%d", len(out))
+  }
+  first, _ := out[0].(map[string]any)
+  if first["type"] != "reasoning" {
+    t.Fatalf("首项应为 reasoning：%v", out[0])
+  }
+}
+
+// Red line: encrypted_content must never appear in any gateway-emitted payload.
+  e := shimEnvelope("resp_l", "m", "hi", shimUsage{}, []string{"think-l"})
+  b, err := json.Marshal(e)
+  if err != nil {
+    t.Fatalf("Marshal 失败：%v", err)
+  }
+  if strings.Contains(string(b), "encrypted_content") {
+    t.Fatalf("envelope 泄漏 encrypted_content：%s", b)
+  }
+  out := shimCompletedItems(map[string]any{"id": "m", "type": "message"}, []rsPending{{idx: 1, id: "rs_1", text: "t"}})
+  b, _ = json.Marshal(out)
+  if strings.Contains(string(b), "encrypted_content") {
+    t.Fatalf("completed output 泄漏 encrypted_content：%s", b)
   }
 }
 
