@@ -329,6 +329,42 @@ func shimSanitize(s string, maxLen int) string {
 	return t
 }
 
+// shimStripPlanMode 脱掉 plan agent 的身份宣告句（harness 自带 system prompt，
+// 不需要模型再宣告 plan mode）。按句子切分，删含 "plan mode" 的句子；
+// fail-open：删完为空则返回原文，绝不回空。
+func shimStripPlanMode(s string) string {
+	var kept []string
+	var cur strings.Builder
+	flush := func() {
+		seg := cur.String()
+		cur.Reset()
+		if seg == "" {
+			return
+		}
+		if strings.Contains(strings.ToLower(seg), "plan mode") {
+			return
+		}
+		kept = append(kept, seg)
+	}
+	for _, r := range s {
+		cur.WriteRune(r)
+		if r == '\n' || r == '.' || r == '!' || r == '?' || r == '\u3002' || r == '\uff01' || r == '\uff1f' {
+			flush()
+		}
+	}
+	flush()
+	out := strings.Join(kept, "")
+	// 收敛多余空行。
+	for strings.Contains(out, "\n\n\n") {
+		out = strings.ReplaceAll(out, "\n\n\n", "\n\n")
+	}
+	out = strings.TrimSpace(out)
+	if out == "" {
+		return strings.TrimSpace(s)
+	}
+	return out
+}
+
 // 纯 message 回吐：opencode 不认识 harness 工具名，永远不回 function_call。
 func shimEnvelope(reqID, model, text string) map[string]any {
 	now := time.Now().Unix()
@@ -552,7 +588,7 @@ func shimHandler(w http.ResponseWriter, req *http.Request) {
 	if r.sessionID != "" {
 		shimStoreSession(fp, r.sessionID)
 	}
-	env := shimEnvelope(reqID, model, r.text)
+	env := shimEnvelope(reqID, model, shimStripPlanMode(r.text))
 	logf("[SHIM %s] done ok ms=%d textLen=%d ses=%s cont=%s ua=%q", reqID, elms, len(r.text), r.sessionID, cont, downUA)
 	if stream {
 		// 规范 responses 流式事件序列（pi-ai 只认这套：output_item.added 建槽，
