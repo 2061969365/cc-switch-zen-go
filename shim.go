@@ -343,6 +343,29 @@ func shimStoreSession(fp, ses string) {
 	}
 }
 
+// shimEvictSession：驱逐死会话映射（-s 报 Session not found 后调用）。
+// 下次同 fp 回到新会话全量重发，不再沿用死 ID。
+func shimEvictSession(fp string) {
+	if fp == "" {
+		return
+	}
+	shimSesMu.Lock()
+	defer shimSesMu.Unlock()
+	delete(shimSes, fp)
+	for i, k := range shimSesQ {
+		if k == fp {
+			shimSesQ = append(shimSesQ[:i], shimSesQ[i+1:]...)
+			break
+		}
+	}
+}
+
+// shimIsSessionNotFound：识别 opencode run -s 死会话硬报错
+// （run.ts: session() 取不到即 "Session not found" + exit 1）。
+func shimIsSessionNotFound(errMsg string) bool {
+	return strings.Contains(errMsg, "Session not found")
+}
+
 // ---------- 回吐清洗与 envelope（移植 sanitizeForJson/responsesEnvelope） ----------
 
 // 去 ANSI 转义/裸控制字符（炸 envelope 的真凶），截断。
@@ -905,6 +928,11 @@ func shimHandler(w http.ResponseWriter, req *http.Request) {
 		}
 		if !lr.ok {
 			logf("[SHIM %s] LIVE ERROR ms=%d firstByte=%dms promptBytes=%d ses=%s cont=%s model=%s ua=%q err=%.200s", reqID, elms, lr.firstByteMs, len(prompt), ses, cont, model, downUA, lr.errMsg)
+			if ses != "" && shimIsSessionNotFound(lr.errMsg) {
+				// 流式已写头无法同请求重试：驱逐映射，下轮自动回到新会话。
+				logf("[SHIM %s] session expired ses=%s, evicted", reqID, ses)
+				shimEvictSession(fp)
+			}
 			return
 		}
 		if lr.sessionID != "" {
@@ -915,6 +943,15 @@ func shimHandler(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 	r := shimRunOpencode(ctx, prompt, ses, model, variant)
+	if !r.ok && !r.timeout && ses != "" && shimIsSessionNotFound(r.errMsg) {
+		// -s 死会话：驱逐映射，按新会话（全量+previous thinking）同请求重试一次。
+		// 加密态丢失是物理定律，保可用不保记忆。
+		logf("[SHIM %s] session expired ses=%s, evict and retry as new", reqID, ses)
+		shimEvictSession(fp)
+		ses = ""
+		prompt = shimSelectPrompt("", in)
+		r = shimRunOpencode(ctx, prompt, "", model, variant)
+	}
 	elms := time.Since(t0).Milliseconds()
 	cont := "new"
 	if ses != "" {

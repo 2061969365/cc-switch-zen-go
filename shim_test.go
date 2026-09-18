@@ -468,6 +468,7 @@ func TestShimEnvelopeReasoning(t *testing.T) {
 }
 
 // Red line: encrypted_content must never appear in any gateway-emitted payload.
+func TestShimNoEncryptedContentLeak(t *testing.T) {
   e := shimEnvelope("resp_l", "m", "hi", shimUsage{}, []string{"think-l"})
   b, err := json.Marshal(e)
   if err != nil {
@@ -480,6 +481,29 @@ func TestShimEnvelopeReasoning(t *testing.T) {
   b, _ = json.Marshal(out)
   if strings.Contains(string(b), "encrypted_content") {
     t.Fatalf("completed output 泄漏 encrypted_content：%s", b)
+  }
+}
+
+// -s 死会话识别：opencode run.ts 的 "Session not found" 硬报错必须被认出。
+func TestShimIsSessionNotFound(t *testing.T) {
+  if !shimIsSessionNotFound("exit status 1 | Session not found") {
+    t.Fatalf("Session not found 未识别")
+  }
+  if shimIsSessionNotFound("exit status 1 | boom") {
+    t.Fatalf("普通失败被误判为死会话")
+  }
+}
+
+// 驱逐后同一 fp 必须回到新会话（下次全量重发，不再沿用死 ID）。
+func TestShimEvictSession(t *testing.T) {
+  fp := "fp-evict-test"
+  shimStoreSession(fp, "ses_dead")
+  if got := shimLookupSession(fp); got != "ses_dead" {
+    t.Fatalf("前置存入失败：%q", got)
+  }
+  shimEvictSession(fp)
+  if got := shimLookupSession(fp); got != "" {
+    t.Fatalf("驱逐后仍命中死会话：%q", got)
   }
 }
 
