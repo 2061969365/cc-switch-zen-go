@@ -245,12 +245,26 @@ func TestShimCmdArgsAlwaysStdin(t *testing.T) {
  if _, err := io.Copy(&sb, stdin); err != nil || sb.String() != p {
  t.Fatalf("%s: stdin content mismatch", name)
  }
- for _, a := range args {
- if a == p {
- t.Fatalf("%s: prompt leaked into argv", name)
- }
- }
- }
+  for _, a := range args {
+  if a == p {
+  t.Fatalf("%s: prompt leaked into argv", name)
+  }
+  }
+  }
+}
+
+// 启动器按平台：windows 经 cmd.exe /c（npm .cmd 垫片必须），
+// linux 直接 exec 可执行文件（npm bin 带 shebang）。
+func TestShimLaunchFor(t *testing.T) {
+  args := []string{"/bin/opencode", "run", "-m", "m"}
+  name, rest := shimLaunchFor("windows", args)
+  if name != "cmd.exe" || len(rest) != 5 || rest[0] != "/c" || rest[1] != "/bin/opencode" || rest[4] != "m" {
+    t.Fatalf("windows 启动器错误：%q %q", name, rest)
+  }
+  name, rest = shimLaunchFor("linux", args)
+  if name != "/bin/opencode" || len(rest) != 3 || rest[0] != "run" {
+    t.Fatalf("linux 应直调：%q %q", name, rest)
+  }
 }
 
 // Header session wins: same body + different x-session-id => different keys;
