@@ -11,6 +11,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -195,29 +196,6 @@ func shimInputToPrompt(body map[string]any) string {
 	return strings.Join(append(sys, parts...), "\n\n")
 }
 
-// tools 定义只作参考附录（opencode 不认识 harness 工具名，不做 function_call 翻译）。
-func shimToolsToPrompt(tools any) string {
-	arr, ok := tools.([]any)
-	if !ok || len(arr) == 0 {
-		return ""
-	}
-	var lines []string
-	lines = append(lines, "\n\n[Tools available in the calling harness (for reference; use your own read-only tools as needed):]")
-	for _, raw := range arr {
-		t, ok := raw.(map[string]any)
-		if !ok {
-			continue
-		}
-		name, _ := t["name"].(string)
-		desc, _ := t["description"].(string)
-		lines = append(lines, fmt.Sprintf("- %s: %s", name, desc))
-	}
-	if len(lines) == 1 {
-		return ""
-	}
-	return strings.Join(lines, "\n")
-}
-
 // 续会话增量：最后一轮 user 文本。
 func shimLastUserText(body map[string]any) string {
 	items, _ := body["input"].([]any)
@@ -339,7 +317,7 @@ func shimSanitize(s string, maxLen int) string {
 }
 
 // 纯 message 回吐：身份归 harness 侧，shim 原文透传，不过问内容。
-func shimEnvelope(reqID, model, text string) map[string]any {
+func shimEnvelope(reqID, model, text string, usage shimUsage) map[string]any {
 	now := time.Now().Unix()
 	output := []any{}
 	if clean := shimSanitize(text, 24000); clean != "" {
@@ -356,7 +334,7 @@ func shimEnvelope(reqID, model, text string) map[string]any {
 	return map[string]any{
 		"id": reqID, "object": "response", "created_at": now,
 		"model": model, "status": status, "output": output,
-		"usage": map[string]any{"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+		"usage": map[string]any{"input_tokens": usage.input, "output_tokens": usage.output, "total_tokens": usage.total},
 	}
 }
 
@@ -368,11 +346,43 @@ type shimResult struct {
 	text      string
 	sessionID string
 	errMsg    string
+	usage     shimUsage
+}
+
+// shimUsage 真实 token 消耗（取自 --format json 的 step_finish.part.tokens）。
+type shimUsage struct {
+	input, output, total int
+}
+
+// step_finish 事件抽 usage：part.tokens.{total,input,output}。
+func shimUsageOf(ev map[string]any) shimUsage {
+	var u shimUsage
+	part, _ := ev["part"].(map[string]any)
+	tok, _ := part["tokens"].(map[string]any)
+	if tok == nil {
+		return u
+	}
+	num := func(k string) int {
+		switch v := tok[k].(type) {
+		case float64:
+			return int(v)
+		case int:
+			return v
+		}
+		return 0
+	}
+	u.total, u.input, u.output = num("total"), num("input"), num("output")
+	if u.total == 0 {
+		u.total = u.input + u.output
+	}
+	return u
 }
 
 // --format json 事件流：只取 text part + 顶层 sessionID（tool 事件不在 stdout，在 DB）。
-func shimParseEvents(out string) (string, string) {
+// step_finish 顺带抽 usage。
+func shimParseEvents(out string) (string, string, shimUsage) {
 	var texts []string
+	var usage shimUsage
 	sessionID := ""
 	for _, line := range strings.Split(out, "\n") {
 		t := strings.TrimSpace(line)
@@ -386,30 +396,39 @@ func shimParseEvents(out string) (string, string) {
 		if s, ok := ev["sessionID"].(string); ok && s != "" {
 			sessionID = s
 		}
-		if ev["type"] == "text" {
+		switch ev["type"] {
+		case "text":
 			if part, ok := ev["part"].(map[string]any); ok {
 				if txt, ok := part["text"].(string); ok {
 					texts = append(texts, txt)
 				}
 			}
+		case "step_finish":
+			if u := shimUsageOf(ev); u.total > 0 {
+				usage = u
+			}
 		}
 	}
-	return strings.Join(texts, ""), sessionID
+	return strings.Join(texts, ""), sessionID, usage
 }
 
-func shimRunOpencode(ctx context.Context, prompt, sessionID, model string) shimResult {
-	args := []string{"/c", shimOpencodeBin, "run", "--pure", "--format", "json", "--agent", shimAgent(), "-m", model}
+func shimCmdArgs(prompt, sessionID, model string) (args []string, stdin *strings.Reader) {
+	args = []string{"/c", shimOpencodeBin, "run", "--pure", "--format", "json", "--agent", shimAgent(), "-m", model}
 	if sessionID != "" {
 		args = append(args, "-s", sessionID)
 	}
-	cmd := exec.CommandContext(ctx, "cmd.exe", args...)
-	// 长 prompt 走 stdin（Node 版只走 argv，此处直接实现）。
-	// Windows 命令行上限 32767 字符，超限则 argv 传空、stdin 喂。
+	// 长 prompt 走 stdin（Windows 命令行上限 32767 字符）。
 	if len(prompt) > 20000 {
-		cmd.Args = append(cmd.Args, "-")
-		cmd.Stdin = strings.NewReader(prompt)
-	} else {
-		cmd.Args = append(cmd.Args, prompt)
+		return append(args, "-"), strings.NewReader(prompt)
+	}
+	return append(args, prompt), nil
+}
+
+func shimRunOpencode(ctx context.Context, prompt, sessionID, model string) shimResult {
+	args, stdin := shimCmdArgs(prompt, sessionID, model)
+	cmd := exec.CommandContext(ctx, "cmd.exe", args...)
+	if stdin != nil {
+		cmd.Stdin = stdin
 	}
 	var outBuf, errBuf bytes.Buffer
 	// stdout 可能很大（system prompt 回显），上限 8MB 截断防 OOM。
@@ -429,8 +448,8 @@ func shimRunOpencode(ctx context.Context, prompt, sessionID, model string) shimR
 		}
 		return shimResult{errMsg: msg}
 	}
-	text, ses := shimParseEvents(outBuf.String())
-	return shimResult{ok: true, text: text, sessionID: ses}
+	text, ses, usage := shimParseEvents(outBuf.String())
+	return shimResult{ok: true, text: text, sessionID: ses, usage: usage}
 }
 
 type limitedWriter struct {
@@ -454,6 +473,121 @@ func tailString(s string, n int) string {
 		return s
 	}
 	return s[len(s)-n:]
+}
+
+// shimLiveResult P0 直播结果。
+type shimLiveResult struct {
+	text        string
+	sessionID   string
+	usage       shimUsage
+	ok          bool
+	timeout     bool
+	errMsg      string
+	firstByteMs int64
+}
+
+// shimStreamLive P0：边跑边转播。created/item.added 立即发（TTFB≈进程启动），
+// stdout 逐行解析，text 事件即发 delta；结束补 done/completed/DONE。
+// 失败发 response.failed（pi-ai 可解析）；下游断开由 ctx 干掉进程，停发。
+func shimStreamLive(ctx context.Context, w http.ResponseWriter, reqID, model, prompt, ses string) shimLiveResult {
+	var r shimLiveResult
+	t0 := time.Now()
+	sink := newSSESink(w)
+	createdAt := time.Now().Unix()
+	msgID := fmt.Sprintf("msg_shim_%d", createdAt)
+	sink.emit(map[string]any{"type": "response.created",
+		"response": map[string]any{"id": reqID, "object": "response", "created_at": createdAt, "model": model, "status": "in_progress", "output": []any{}}})
+	sink.emit(map[string]any{"type": "response.output_item.added", "output_index": 0,
+		"item": map[string]any{"id": msgID, "type": "message", "role": "assistant",
+			"content": []any{map[string]any{"type": "output_text", "text": "", "annotations": []any{}}}}})
+	args, stdin := shimCmdArgs(prompt, ses, model)
+	cmd := exec.CommandContext(ctx, "cmd.exe", args...)
+	if stdin != nil {
+		cmd.Stdin = stdin
+	}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return shimLiveResult{errMsg: "stdout pipe: " + err.Error()}
+	}
+	var errBuf bytes.Buffer
+	cmd.Stderr = &limitedWriter{w: &errBuf, n: 1 << 20}
+	if err := cmd.Start(); err != nil {
+		msg := err.Error()
+		if tail := tailString(errBuf.String(), 1500); tail != "" {
+			msg += " | " + tail
+		}
+		return shimLiveResult{errMsg: msg}
+	}
+	var texts []string
+	sessionID := ""
+	var usage shimUsage
+	sc := bufio.NewScanner(stdout)
+	sc.Buffer(make([]byte, 64<<10), 4<<20)
+	for sc.Scan() {
+		t := strings.TrimSpace(sc.Text())
+		if t == "" || t[0] != '{' {
+			continue
+		}
+		var ev map[string]any
+		if err := json.Unmarshal([]byte(t), &ev); err != nil {
+			continue
+		}
+		if s, ok := ev["sessionID"].(string); ok && s != "" {
+			sessionID = s
+		}
+		switch ev["type"] {
+		case "text":
+			part, _ := ev["part"].(map[string]any)
+			txt, _ := part["text"].(string)
+			if txt == "" {
+				continue
+			}
+			clean := shimSanitize(txt, 1<<30)
+			texts = append(texts, clean)
+			if r.firstByteMs == 0 {
+				r.firstByteMs = time.Since(t0).Milliseconds()
+			}
+			sink.emit(map[string]any{"type": "response.output_text.delta", "output_index": 0,
+				"item_id": msgID, "delta": clean})
+		case "step_finish":
+			if u := shimUsageOf(ev); u.total > 0 {
+				usage = u
+			}
+		}
+	}
+	text := strings.Join(texts, "")
+	waitErr := cmd.Wait()
+	if ctx.Err() == context.DeadlineExceeded {
+		r.timeout = true
+		r.errMsg = tailString(errBuf.String(), 2000)
+		sink.emit(map[string]any{"type": "response.failed",
+			"response": map[string]any{"id": reqID, "status": "failed",
+				"error": map[string]any{"type": "timeout", "message": "shim timeout"}}})
+		sink.done()
+		return r
+	}
+	if waitErr != nil {
+		r.errMsg = waitErr.Error()
+		if tail := tailString(errBuf.String(), 1500); tail != "" {
+			r.errMsg += " | " + tail
+		}
+		sink.emit(map[string]any{"type": "response.failed",
+			"response": map[string]any{"id": reqID, "status": "failed",
+				"error": map[string]any{"type": "shim_error", "message": r.errMsg}}})
+		sink.done()
+		return r
+	}
+	r.ok = true
+	r.text, r.sessionID, r.usage = text, sessionID, usage
+	doneItem := map[string]any{"id": msgID, "type": "message", "role": "assistant",
+		"content": []any{map[string]any{"type": "output_text", "text": text, "annotations": []any{}}}}
+	sink.emit(map[string]any{"type": "response.output_item.done", "output_index": 0, "item": doneItem})
+	sink.emit(map[string]any{"type": "response.completed",
+		"response": map[string]any{"id": reqID, "object": "response", "created_at": createdAt, "model": model,
+			"status": "completed", "output": []any{doneItem},
+			"usage": map[string]any{"input_tokens": usage.input, "output_tokens": usage.output, "total_tokens": usage.total}}})
+	sink.done()
+	return r
 }
 
 // ---------- 并发门 + HTTP 入口 ----------
@@ -509,6 +643,7 @@ func shimHandler(w http.ResponseWriter, req *http.Request) {
 		model = "test/" + model
 	}
 	// 会话钉定：同对话续 -s，只发增量；新对话拼全量。
+	// 无提示词注入：harness 的 instructions/input/tools 原样转文本，不附加任何附录。
 	fp := shimFingerprint(in)
 	ses := shimLookupSession(fp)
 	var prompt string
@@ -517,7 +652,6 @@ func shimHandler(w http.ResponseWriter, req *http.Request) {
 	} else {
 		prompt = shimInputToPrompt(in)
 	}
-	prompt += shimToolsToPrompt(in["tools"])
 	if strings.TrimSpace(prompt) == "" {
 		writeConvError(w, http.StatusBadRequest, "empty prompt")
 		return
@@ -536,6 +670,29 @@ func shimHandler(w http.ResponseWriter, req *http.Request) {
 	}
 	ctx, cancel := context.WithTimeout(req.Context(), shimTimeout())
 	defer cancel()
+	if stream {
+		// P0 直播：边跑边转播，不等子进程结束。
+		lr := shimStreamLive(ctx, w, reqID, model, prompt, ses)
+		elms := time.Since(t0).Milliseconds()
+		cont := "new"
+		if ses != "" {
+			cont = "yes"
+		}
+		if lr.timeout {
+			logf("[SHIM %s] LIVE TIMEOUT ms=%d firstByte=%dms ua=%q", reqID, elms, lr.firstByteMs, downUA)
+			return
+		}
+		if !lr.ok {
+			logf("[SHIM %s] LIVE ERROR ms=%d firstByte=%dms ua=%q err=%.200s", reqID, elms, lr.firstByteMs, downUA, lr.errMsg)
+			return
+		}
+		if lr.sessionID != "" {
+			shimStoreSession(fp, lr.sessionID)
+		}
+		logf("[SHIM %s] LIVE done ok ms=%d firstByte=%dms textLen=%d in=%d out=%d ses=%s cont=%s ua=%q",
+			reqID, elms, lr.firstByteMs, len(lr.text), lr.usage.input, lr.usage.output, lr.sessionID, cont, downUA)
+		return
+	}
 	r := shimRunOpencode(ctx, prompt, ses, model)
 	elms := time.Since(t0).Milliseconds()
 	cont := "new"
@@ -561,23 +718,15 @@ func shimHandler(w http.ResponseWriter, req *http.Request) {
 	if r.sessionID != "" {
 		shimStoreSession(fp, r.sessionID)
 	}
-	env := shimEnvelope(reqID, model, r.text)
-	logf("[SHIM %s] done ok ms=%d textLen=%d ses=%s cont=%s ua=%q", reqID, elms, len(r.text), r.sessionID, cont, downUA)
-	if stream {
-		// 规范 responses 流式事件序列（pi-ai 只认这套：output_item.added 建槽，
-		// delta 累文本，output_item.done 落槽，completed 结算；整包 output 会被无视，
-		// 缺槽的 delta 直接丢弃——此前自造三件套导致 harness 解析出空）。
-		shimEmitStream(w, reqID, model, env)
-		return
-	}
+	env := shimEnvelope(reqID, model, r.text, r.usage)
+	logf("[SHIM %s] done ok ms=%d textLen=%d in=%d out=%d ses=%s cont=%s ua=%q", reqID, elms, len(r.text), r.usage.input, r.usage.output, r.sessionID, cont, downUA)
 	w.Header().Set("Content-Type", "application/json")
 	b, _ := json.Marshal(env)
 	_, _ = w.Write(b)
 }
 
-// shimEmitStream 按规范序列吐流：created → item.added → text.delta* →
-// item.done → completed → [DONE]。文本按 500 字切块，有流式感。
-func shimEmitStream(w http.ResponseWriter, reqID, model string, env map[string]any) {
+// shimEmitStream 按规范序列吐流（单测与回放用；线上流式走 shimStreamLive 直播）。
+func shimEmitStream(w http.ResponseWriter, reqID, model string, env map[string]any, usage shimUsage) {
 	sink := newSSESink(w)
 	createdAt, _ := env["created_at"].(int64)
 	msgID := fmt.Sprintf("msg_shim_%d", createdAt)
@@ -616,6 +765,6 @@ func shimEmitStream(w http.ResponseWriter, reqID, model string, env map[string]a
 	sink.emit(map[string]any{"type": "response.completed",
 		"response": map[string]any{"id": reqID, "object": "response", "created_at": createdAt, "model": model,
 			"status": "completed", "output": env["output"],
-			"usage": map[string]any{"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}}})
+			"usage": map[string]any{"input_tokens": usage.input, "output_tokens": usage.output, "total_tokens": usage.total}}})
 	sink.done()
 }
